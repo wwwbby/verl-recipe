@@ -1,0 +1,9 @@
+working_dir: ./
+excludes: ["/.git/"]
+env_vars:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  HCCL_HOST_SOCKET_PORT_RANGE: "auto"
+  HCCL_NPU_SOCKET_PORT_RANGE: "auto"
+  PYTHONPATH: "/home/miniconda3/envs/ys_verl/lib/python3.11/site-packages:$PYTHONPATH"
+  PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
