@@ -30,18 +30,16 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.attention_processor import Attention
 from einops import repeat
-
-from transformers.utils.import_utils import is_torch_npu_available
-from transformers.modeling_flash_attention_utils import _lazy_imports
-flash_attn_func, flash_attn_varlen_func, pad_input, unpad_input = _lazy_imports("flash_attention_2")
-
 from recipe.dance_grpo.mammothmoda2.model.mammothmoda2_dit.rope_real import apply_real_rotary_emb
+from transformers.modeling_flash_attention_utils import _lazy_imports
+from transformers.utils.import_utils import is_torch_npu_available
+
+flash_attn_func, flash_attn_varlen_func, pad_input, unpad_input = _lazy_imports("flash_attention_2")
 
 if is_torch_npu_available():
     from recipe.dance_grpo.mammothmoda2.model.mammothmoda2_dit.utils import index_first_axis
 else:
     from flash_attn.bert_padding import index_first_axis
-
 
 
 class AttnProcessorFlash2Varlen:
@@ -273,7 +271,8 @@ def scaled_dot_product_attention_torch(
     _, _, L_k, _ = key.shape
 
     # Compute attention scores
-    attn_scores = torch.matmul(query, key.transpose(-2, -1))  # (B, num_heads, L_q, L_k)
+    # (B, num_heads, L_q, L_k)
+    attn_scores = torch.matmul(query, key.transpose(-2, -1))
     if scale is not None:
         attn_scores = attn_scores / scale
     else:
@@ -427,7 +426,8 @@ class AttnProcessor:
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        # explicitly repeat key and value to match query length, otherwise using enable_gqa=True results in MATH backend of sdpa in our test of pytorch2.6
+        # explicitly repeat key and value to match query length,
+        # otherwise using enable_gqa=True results in MATH backend of sdpa in our test of pytorch2.6
         key = key.repeat_interleave(query.size(-3) // key.size(-3), -3)
         value = value.repeat_interleave(query.size(-3) // value.size(-3), -3)
 

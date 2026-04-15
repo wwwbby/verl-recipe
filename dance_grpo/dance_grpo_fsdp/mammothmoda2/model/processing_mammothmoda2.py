@@ -41,7 +41,8 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
-num_digits = lambda n: len(str(abs(int(n))))
+def num_digits(n):
+    return len(str(abs(int(n))))
 
 
 class Mammothmoda2ImagesKwargs(Qwen3VLImagesKwargs):
@@ -84,10 +85,12 @@ class Mammothmoda2Processor(Qwen3VLProcessor):
         **kwargs,  # noqa: ARG002
     ) -> None:
         super().__init__(image_processor, tokenizer, video_processor, chat_template=chat_template, **kwargs)
-        self.gen_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        self.gen_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
         self.gen_patch_size = gen_patch_size
         self.gen_image_token = gen_image_token
 
@@ -134,14 +137,14 @@ class Mammothmoda2Processor(Qwen3VLProcessor):
         else:
             image_inputs = {}
             image_grid_thw = None
-        
+
         if gen_images is not None:
             gen_image_inputs = [self.gen_transform(img).unsqueeze(0) for img in gen_images]
             h_patchs = [img.shape[2] // self.gen_patch_size for img in gen_image_inputs]
             w_patchs = [img.shape[3] // self.gen_patch_size for img in gen_image_inputs]
             gen_image_token_nums = [
                 h_patch * (w_patch + 1) + 5 + num_digits(h_patch) + num_digits(w_patch)
-                for h_patch, w_patch in zip(h_patchs, w_patchs)
+                for h_patch, w_patch in zip(h_patchs, w_patchs, strict=True)
             ]
         else:
             gen_image_inputs = None
@@ -172,7 +175,9 @@ class Mammothmoda2Processor(Qwen3VLProcessor):
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
         if gen_image_token_nums is not None:
-            assert "".join(text).count(self.gen_image_token) == len(gen_image_token_nums), "gen_image_token_nums is not consistent with gen_image in text"
+            assert "".join(text).count(self.gen_image_token) == len(gen_image_token_nums), (
+                "gen_image_token_nums is not consistent with gen_image in text"
+            )
             index = 0
             for i in range(len(text)):
                 while self.gen_image_token in text[i]:
@@ -189,7 +194,8 @@ class Mammothmoda2Processor(Qwen3VLProcessor):
                     metadata = video_metadata[index]
                     if metadata.fps is None:
                         logger.warning_once(
-                            "Qwen3VL requires frame timestamps to construct prompts, but the `fps` of the input video could not be inferred. "
+                            "Qwen3VL requires frame timestamps to construct prompts, "
+                            "but the `fps` of the input video could not be inferred. "
                             "Probably `video_metadata` was missing from inputs and you passed pre-sampled frames. "
                             "Defaulting to `fps=24`. Please provide `video_metadata` for more accurate results."
                         )
@@ -254,7 +260,8 @@ class Mammothmoda2Processor(Qwen3VLProcessor):
                 )
                 negative_ids = negative_inputs.input_ids  # [bs, seq_len]
                 negative_mask = negative_inputs.attention_mask  # full 1
-                inputs["negative_ids"] = negative_ids  # Already Tensor, directly attach.
+                # Already Tensor, directly attach.
+                inputs["negative_ids"] = negative_ids
                 inputs["negative_mask"] = negative_mask
         return inputs
 
@@ -265,7 +272,7 @@ class Mammothmoda2Processor(Qwen3VLProcessor):
         t2i_generate: bool = False,
         ar_height: int = 16,
         ar_width: int = 16,
-        **kwargs
+        **kwargs,
     ) -> str:
         if t2i_generate is True:  # For t2i, use different chat template.
             kwargs["t2i_generate"] = t2i_generate

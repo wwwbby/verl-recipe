@@ -24,17 +24,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps
+from recipe.dance_grpo.mammothmoda2.model.mammothmoda2_qwen3_vl.modeling_mammothmoda2_qwen3_vl import Qwen3VLTextRMSNorm
 from torch import nn
 from transformers.modeling_flash_attention_utils import (
     is_flash_attn_available,
     is_torch_npu_available,
 )
-
-from recipe.dance_grpo.mammothmoda2.model.mammothmoda2_qwen3_vl.modeling_mammothmoda2_qwen3_vl import Qwen3VLTextRMSNorm
 
 from .embeddings import TimestepEmbedding
 
@@ -122,7 +121,8 @@ class LuminaLayerNormContinuous(nn.Module):
         x: torch.Tensor,
         conditioning_embedding: torch.Tensor,
     ) -> torch.Tensor:
-        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
+        # convert back to the original dtype in case `conditioning_embedding``
+        # is upcasted to float32 (needed for hunyuanDiT)
         scale = self.linear_1(self.silu(conditioning_embedding).to(x.dtype))
         x = self.norm(x) * (1 + scale)[:, None, :]
 
@@ -236,7 +236,7 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
         dtype: torch.dtype,
         ar_image_hidden_states: torch.Tensor | None = None,
         ar_image_attention_mask: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         timestep_proj = self.time_proj(timestep).to(dtype=dtype)
         time_embed = self.timestep_embedder(timestep_proj)
         caption_embed = self.caption_embedder(text_hidden_states)

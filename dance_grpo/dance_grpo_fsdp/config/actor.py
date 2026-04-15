@@ -11,20 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
 
-from omegaconf import MISSING
-
-from verl.base_config import BaseConfig
-from verl.trainer.config import CheckpointConfig
-from verl.utils.profiler.config import ProfilerConfig
 from verl.workers.config.actor import FSDPActorConfig
-from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig
-from verl.workers.config.model import HFModelConfig
-from verl.workers.config.optimizer import OptimizerConfig
 
 __all__ = ["DiffusionFSDPActorConfig"]
+
 
 @dataclass
 class DiffusionFSDPActorConfig(FSDPActorConfig):
@@ -43,10 +35,10 @@ class DiffusionFSDPActorConfig(FSDPActorConfig):
         use_remove_padding (bool): Whether to remove padding tokens in inputs during training
     """
 
-    ppo_adv_clip_max: float = 10.0,
-    ppo_kl_coeff: float = 0.1,
-    ppo_max_grad_norm: float = 1.0,
-    shift: float = 1.0,
+    ppo_adv_clip_max: float = (10.0,)
+    ppo_kl_coeff: float = (0.1,)
+    ppo_max_grad_norm: float = (1.0,)
+    shift: float = (1.0,)
     timestep_fraction: float = 1.0
     sampling_steps: float = 10.0
     micro_batch_size: int = 1

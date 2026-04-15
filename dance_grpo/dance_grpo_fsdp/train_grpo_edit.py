@@ -1,59 +1,47 @@
 import argparse
 import math
-import os
 import multiprocessing
+import os
 import random
-from pathlib import Path
-from fastvideo.utils.parallel_states import (
-    initialize_sequence_parallel_state,
-    destroy_sequence_parallel_group,
-    get_sequence_parallel_state,
-)
-from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper_imgedit
-from fastvideo.utils.validation import log_validation
 import time
-from torch.utils.data import DataLoader
-import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict, StateDictOptions
+from collections import deque
 
-from torch.utils.data.distributed import DistributedSampler
-from fastvideo.utils.dataset_utils import LengthGroupedSampler
+import torch
+import torch.distributed as dist
 import wandb
 from accelerate.utils import set_seed
-from tqdm.auto import tqdm
-from fastvideo.utils.fsdp_util import get_dit_fsdp_kwargs, apply_fsdp_checkpointing
+from diffusers import AutoencoderKL
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from fastvideo.dataset.latent_mammoth2_rl_imgedit_datasets import LatentEditDataset, latent_collate_function
-import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from fastvideo.rewards.editscore.editscore_reward_model import create_editscore_reward_model
 from fastvideo.utils.checkpoint import (
     save_checkpoint,
-    save_lora_checkpoint,
 )
+from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper_imgedit
+from fastvideo.utils.ema import FSDP_EMA, save_ema_checkpoint
+from fastvideo.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
 from fastvideo.utils.logging_ import main_print
-from diffusers.image_processor import VaeImageProcessor
-
-check_min_version("0.31.0")
-import time
-from collections import deque
-from typing import List
-from diffusers import AutoencoderKL
-from contextlib import contextmanager
-from safetensors.torch import save_file
-
-import torch_npu
+from fastvideo.utils.parallel_states import (
+    destroy_sequence_parallel_group,
+    get_sequence_parallel_state,
+    initialize_sequence_parallel_state,
+)
+from mammoth2.models.attention_processor import USE_REAL_ROPE
+from mammoth2.models.transformers.rope import RotaryPosEmbed
+from mammoth2.models.transformers.rope_real import RotaryPosEmbedReal
 
 # Mammoth2 imports
 from mammoth2.models.transformers.transformer_dit import Transformer2DModel
-from mammoth2.models.transformers.rope import RotaryPosEmbed
-from mammoth2.models.transformers.rope_real import RotaryPosEmbedReal
-from mammoth2.models.attention_processor import USE_REAL_ROPE
-from fastvideo.utils.ema import FSDP_EMA, save_ema_checkpoint
-from fastvideo.rewards.editscore.editscore_reward_model import create_editscore_reward_model
-from omegaconf import OmegaConf
 from mammoth2.models.unified_mammoth2model import replace_rmsnorm_with_custom
+from omegaconf import OmegaConf
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
+
+check_min_version("0.31.0")
 
 
 def move_to_device(obj, device: torch.device):
@@ -64,6 +52,7 @@ def move_to_device(obj, device: torch.device):
     if isinstance(obj, dict):
         return {k: move_to_device(v, device) for k, v in obj.items()}
     return obj
+
 
 def sd3_time_shift(shift, t):
     return (shift * t) / (1 + (shift - 1) * t)
@@ -97,6 +86,7 @@ def compute_eta_t(
         scale = torch.clamp(scale, min=min_ratio)
     return torch.as_tensor(eta, dtype=t.dtype, device=t.device) * scale
 
+
 def mammoth2_step(
     model_output: torch.Tensor,
     latents: torch.Tensor,
@@ -123,11 +113,12 @@ def mammoth2_step(
     std_dev_t = eta_t * torch.sqrt(torch.abs(dt) + 1e-12)
 
     if sde_solver:
-        prev_sample_mean = prev_sample_mean + (-0.5 * (eta_t ** 2)) * score_estimate * dt
+        prev_sample_mean = prev_sample_mean + (-0.5 * (eta_t**2)) * score_estimate * dt
 
     if grpo and prev_sample is None:
         if generators is not None and len(generators) == prev_sample_mean.shape[0]:
             from diffusers.utils.torch_utils import randn_tensor
+
             noise = randn_tensor(
                 prev_sample_mean.shape,
                 generator=generators,
@@ -139,12 +130,12 @@ def mammoth2_step(
         prev_sample = prev_sample_mean + noise * std_dev_t
 
     if grpo:
-        diff = (prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32))
+        diff = prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)
         std32 = std_dev_t.to(torch.float32)
-        var_t = (std32 ** 2).clamp_min(1e-20)
+        var_t = (std32**2).clamp_min(1e-20)
         log_std = torch.log(std32.clamp_min(1e-20))
         log_two_pi = torch.log(torch.tensor(2.0 * math.pi, device=std_dev_t.device, dtype=torch.float32))
-        log_prob = (-(diff ** 2) / (2 * var_t)) - log_std - 0.5 * log_two_pi
+        log_prob = (-(diff**2) / (2 * var_t)) - log_std - 0.5 * log_two_pi
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
         return prev_sample, pred_original_sample, log_prob
     else:
@@ -173,15 +164,17 @@ def mammoth2_step_aligned(
     pred_original_sample = x_hat
     score_estimate = -(latents - t * x_hat) / ((1.0 - t) ** 2 + 1e-12)
 
-    eta_t = eta#compute_eta_t(eta, t, schedule=eps_schedule, power=eps_power, min_ratio=eps_min_ratio)
+    # compute_eta_t(eta, t, schedule=eps_schedule, power=eps_power, min_ratio=eps_min_ratio)
+    eta_t = eta
     std_dev_t = eta_t * torch.sqrt(torch.abs(dt) + 1e-12)
 
     if sde_solver:
-        prev_sample_mean = prev_sample_mean + (0.5 * (eta_t ** 2)) * score_estimate * dt
+        prev_sample_mean = prev_sample_mean + (0.5 * (eta_t**2)) * score_estimate * dt
 
     if grpo and prev_sample is None:
         if generators is not None and len(generators) == prev_sample_mean.shape[0]:
             from diffusers.utils.torch_utils import randn_tensor
+
             noise = randn_tensor(
                 prev_sample_mean.shape,
                 generator=generators,
@@ -193,12 +186,12 @@ def mammoth2_step_aligned(
         prev_sample = prev_sample_mean + noise * std_dev_t
 
     if grpo:
-        diff = (prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32))
+        diff = prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)
         std32 = std_dev_t.to(torch.float32)
-        var_t = (std32 ** 2).clamp_min(1e-20)
+        var_t = (std32**2).clamp_min(1e-20)
         log_std = torch.log(std32.clamp_min(1e-20))
         log_two_pi = torch.log(torch.tensor(2.0 * math.pi, device=std_dev_t.device, dtype=torch.float32))
-        log_prob = (-(diff ** 2) / (2 * var_t)) - log_std - 0.5 * log_two_pi
+        log_prob = (-(diff**2) / (2 * var_t)) - log_std - 0.5 * log_two_pi
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
         return prev_sample, pred_original_sample, log_prob, prev_sample_mean, std_dev_t
     else:
@@ -240,7 +233,7 @@ def run_sample_step(
     negative_text_hidden_states=None,
     negative_text_attention_mask=None,
     sde_sample: bool = False,
-    ):
+):
     if grpo_sample:
         all_latents = [z]
         all_log_probs = []
@@ -258,7 +251,7 @@ def run_sample_step(
                 text_hidden_states = text_hidden_states.contiguous().clone()
                 text_attention_mask = text_attention_mask.to(torch.bool).contiguous().clone()
                 optional_kwargs = {}
-                optional_kwargs['ref_image_hidden_states'] = ref_latent
+                optional_kwargs["ref_image_hidden_states"] = ref_latent
 
                 if bool(getattr(args, "use_negative_cfg", 1)):
                     pred_c = transformer(
@@ -270,8 +263,22 @@ def run_sample_step(
                         **optional_kwargs,
                     )
                     use_neg = (negative_text_hidden_states is not None) and (negative_text_attention_mask is not None)
-                    uncond_states = (negative_text_hidden_states if use_neg else torch.zeros_like(text_hidden_states)).contiguous().clone()
-                    uncond_mask = ((negative_text_attention_mask if use_neg else torch.zeros_like(text_attention_mask, dtype=torch.bool)).to(torch.bool)).contiguous().clone()
+                    uncond_states = (
+                        (negative_text_hidden_states if use_neg else torch.zeros_like(text_hidden_states))
+                        .contiguous()
+                        .clone()
+                    )
+                    uncond_mask = (
+                        (
+                            (
+                                negative_text_attention_mask
+                                if use_neg
+                                else torch.zeros_like(text_attention_mask, dtype=torch.bool)
+                            ).to(torch.bool)
+                        )
+                        .contiguous()
+                        .clone()
+                    )
                     pred_u = transformer(
                         z,
                         (timestep_in.to(z.dtype) / 1000).contiguous().clone(),
@@ -292,7 +299,7 @@ def run_sample_step(
                             freqs_cis=freqs_cis,
                             **optional_kwargs,
                         )
-                        
+
                         pred = pred_u + s * (pred_c - pred_ref) + s_image * (pred_ref - pred_u)
                     else:
                         pred = pred_u + s * (pred_c - pred_u)
@@ -329,16 +336,24 @@ def run_sample_step(
                 z = (z.to(torch.float32) + dt * pred.to(torch.float32)).to(torch.bfloat16)
 
                 # Compute a consistent per-step log_prob under zero-noise assumption for PPO bookkeeping
-                eta_t = compute_eta_t(args.eta, torch.as_tensor(t, device=z.device, dtype=torch.float32), schedule=args.eps_schedule, power=args.eps_power, min_ratio=args.eps_min_ratio)
-                std_dev_t = eta_t * torch.sqrt(torch.abs(torch.as_tensor(dt, device=z.device, dtype=torch.float32)) + 1e-12)
-                prev_mean = (all_latents[-1].to(torch.float32) + dt * pred.to(torch.float32))
+                eta_t = compute_eta_t(
+                    args.eta,
+                    torch.as_tensor(t, device=z.device, dtype=torch.float32),
+                    schedule=args.eps_schedule,
+                    power=args.eps_power,
+                    min_ratio=args.eps_min_ratio,
+                )
+                std_dev_t = eta_t * torch.sqrt(
+                    torch.abs(torch.as_tensor(dt, device=z.device, dtype=torch.float32)) + 1e-12
+                )
+                prev_mean = all_latents[-1].to(torch.float32) + dt * pred.to(torch.float32)
                 prev_sample = prev_mean  # zero noise path
-                diff = (prev_sample - prev_mean)
+                diff = prev_sample - prev_mean
                 std32 = std_dev_t.to(torch.float32)
-                var_t = (std32 ** 2).clamp_min(1e-20)
+                var_t = (std32**2).clamp_min(1e-20)
                 log_two_pi = torch.log(torch.tensor(2.0 * math.pi, device=std_dev_t.device, dtype=torch.float32))
                 # elementwise log_prob then sum over non-batch dims
-                elem_log_prob = (-(diff ** 2) / (2 * var_t)) - torch.log(std32.clamp_min(1e-20)) - 0.5 * log_two_pi
+                elem_log_prob = (-(diff**2) / (2 * var_t)) - torch.log(std32.clamp_min(1e-20)) - 0.5 * log_two_pi
                 log_prob = elem_log_prob.mean(dim=tuple(range(1, elem_log_prob.ndim)))
 
                 all_latents.append(z)
@@ -369,7 +384,7 @@ def grpo_one_step(
         freqs_cis = build_freqs_cis(transformer, latents.device)
         timestep_in = timestep.repeat(B).to(latents.dtype).clone() / 1000
         optional_kwargs = {}
-        optional_kwargs['ref_image_hidden_states'] = ref_latents
+        optional_kwargs["ref_image_hidden_states"] = ref_latents
 
         if bool(getattr(args, "use_negative_cfg", 1)):
             pred_c = transformer(
@@ -382,7 +397,9 @@ def grpo_one_step(
             )
             use_neg = (negative_text_hidden_states is not None) and (negative_text_attention_mask is not None)
             uncond_states = negative_text_hidden_states if use_neg else torch.zeros_like(text_hidden_states)
-            uncond_mask = (negative_text_attention_mask if use_neg else torch.zeros_like(text_attention_mask, dtype=torch.bool)).to(torch.bool)
+            uncond_mask = (
+                negative_text_attention_mask if use_neg else torch.zeros_like(text_attention_mask, dtype=torch.bool)
+            ).to(torch.bool)
             pred_u = transformer(
                 latents,
                 timestep_in,
@@ -403,7 +420,7 @@ def grpo_one_step(
                     freqs_cis=freqs_cis,
                     **optional_kwargs,
                 )
-                
+
                 pred = pred_u + s * (pred_c - pred_ref) + s_image * (pred_ref - pred_u)
             else:
                 pred = pred_u + s * (pred_c - pred_u)
@@ -439,15 +456,23 @@ def grpo_one_step(
         t = timesteps_full[i]
         t_next = timesteps_full[i + 1]
         dt = t_next - t
-        prev_mean = (latents.to(torch.float32) + dt * pred.to(torch.float32))
+        prev_mean = latents.to(torch.float32) + dt * pred.to(torch.float32)
         prev_sample = pre_latents.to(torch.float32)
-        eta_t = compute_eta_t(args.eta if args.eta is not None else 0.0, torch.as_tensor(t, device=latents.device, dtype=torch.float32), schedule=args.eps_schedule, power=args.eps_power, min_ratio=args.eps_min_ratio)
-        std_dev_t = eta_t * torch.sqrt(torch.abs(torch.as_tensor(dt, device=latents.device, dtype=torch.float32)) + 1e-12)
-        diff = (prev_sample - prev_mean)
+        eta_t = compute_eta_t(
+            args.eta if args.eta is not None else 0.0,
+            torch.as_tensor(t, device=latents.device, dtype=torch.float32),
+            schedule=args.eps_schedule,
+            power=args.eps_power,
+            min_ratio=args.eps_min_ratio,
+        )
+        std_dev_t = eta_t * torch.sqrt(
+            torch.abs(torch.as_tensor(dt, device=latents.device, dtype=torch.float32)) + 1e-12
+        )
+        diff = prev_sample - prev_mean
         std32 = std_dev_t.to(torch.float32)
-        var_t = (std32 ** 2).clamp_min(1e-20)
+        var_t = (std32**2).clamp_min(1e-20)
         log_two_pi = torch.log(torch.tensor(2.0 * math.pi, device=std_dev_t.device, dtype=torch.float32))
-        elem_log_prob = (-(diff ** 2) / (2 * var_t)) - torch.log(std32.clamp_min(1e-20)) - 0.5 * log_two_pi
+        elem_log_prob = (-(diff**2) / (2 * var_t)) - torch.log(std32.clamp_min(1e-20)) - 0.5 * log_two_pi
         log_prob = elem_log_prob.mean(dim=tuple(range(1, elem_log_prob.ndim)))
         return log_prob
 
@@ -458,16 +483,14 @@ def calculate_rewards_async(args_tuple):
     rank = int(os.environ["RANK"])
     prompts, images = args_tuple
     # Ask hybrid reward model for detailed metadata so we can log per-component rewards
-    rewards_with_meta = reward_model.batch_calculate_rewards(
-        prompts, images, return_metadata=True
-    )
-    
+    rewards_with_meta = reward_model.batch_calculate_rewards(prompts, images, return_metadata=True)
+
     # rewards_with_meta -> (rewards: List[float], metadata_list: List[Dict])
     if isinstance(rewards_with_meta, tuple) and len(rewards_with_meta) == 2:
         hybrid_rewards, metadata_list = rewards_with_meta
     else:
         hybrid_rewards, metadata_list = rewards_with_meta, None
-    
+
     rewards_cpu = [float(r) for r in hybrid_rewards]
     metadata_cpu = metadata_list if metadata_list is not None else [{} for _ in rewards_cpu]
     end_time = time.time()
@@ -476,7 +499,10 @@ def calculate_rewards_async(args_tuple):
 
     return rewards_cpu, metadata_cpu
 
+
 reward_model = None
+
+
 def init_reward_model_worker(psm, num_pass):
     global reward_model
     reward_model = create_editscore_reward_model(psm=psm, num_pass=num_pass)
@@ -484,7 +510,7 @@ def init_reward_model_worker(psm, num_pass):
 
 def sample_reference_model(
     args,
-    device, 
+    device,
     transformer,
     vae,
     text_hidden_states,
@@ -499,16 +525,17 @@ def sample_reference_model(
     # optional negatives for CFG
     negative_text_hidden_states=None,
     negative_text_attention_masks=None,
-    
 ):
     sample_steps = args.sampling_steps
     # Use forward-time schedule t in [0,1] to match SRPO sampling flow
     sigma_schedule = torch.linspace(0, 1, sample_steps + 1).to(device)
     sigma_schedule = omni_time_shift(args.shift, sigma_schedule)
     freqs_cis = build_freqs_cis(transformer, device)
-    pool = multiprocessing.Pool(processes=args.reward_num_workers,
-            initializer=init_reward_model_worker,
-            initargs=(args.editscore_psm, args.editscore_num_pass))
+    pool = multiprocessing.Pool(
+        processes=args.reward_num_workers,
+        initializer=init_reward_model_worker,
+        initargs=(args.editscore_psm, args.editscore_num_pass),
+    )
 
     image_processor = VaeImageProcessor(16)
     rank = int(os.environ["RANK"])
@@ -520,7 +547,13 @@ def sample_reference_model(
     consistency_rewards = []
     perceptual_quality_rewards = []
 
-    for sample_idx, (text_hidden_state, text_attention_mask, ref_latent, edit_prompt, ref_image) in enumerate(zip(text_hidden_states, text_attention_masks, ref_latents, edit_prompts, ref_images)):
+    for sample_idx, (
+        text_hidden_state,
+        text_attention_mask,
+        ref_latent,
+        edit_prompt,
+        ref_image,
+    ) in enumerate(zip(text_hidden_states, text_attention_masks, ref_latents, edit_prompts, ref_images, strict=True)):
         B = text_hidden_state.shape[0]
         IN_CHANNELS, latent_w, latent_h = ref_latent[0].shape[1], ref_latent[0].shape[2], ref_latent[0].shape[3]
 
@@ -528,25 +561,33 @@ def sample_reference_model(
         batch_indices = torch.chunk(torch.arange(B), num_chunks)
         edit_prompt_list = [edit_prompt] * B
         if args.init_same_noise:
-            input_latents = torch.randn(
+            input_latents = (
+                torch.randn(
                     (1, IN_CHANNELS, latent_w, latent_h),
                     device=device,
                     dtype=torch.bfloat16,
-                ).contiguous().clone()
+                )
+                .contiguous()
+                .clone()
+            )
             input_latents = input_latents.repeat(sample_batch_size, 1, 1, 1).contiguous().clone()
 
         _all_latents = []
         _all_log_probs = []
         _all_rewards = []
         reward_futures = []
-        
+
         for index, batch_idx in enumerate(batch_indices):
             start_time = time.time()
             batch_text_hidden_state = text_hidden_state[batch_idx].contiguous().clone()
             batch_text_attention_mask = text_attention_mask[batch_idx].to(torch.bool).contiguous().clone()
             if negative_text_hidden_states is not None and negative_text_hidden_states[0] is not None:
-                batch_negative_text_hidden_state = negative_text_hidden_states[sample_idx][batch_idx].contiguous().clone()
-                batch_negative_text_attention_mask = negative_text_attention_masks[sample_idx][batch_idx].to(torch.bool).contiguous().clone()
+                batch_negative_text_hidden_state = (
+                    negative_text_hidden_states[sample_idx][batch_idx].contiguous().clone()
+                )
+                batch_negative_text_attention_mask = (
+                    negative_text_attention_masks[sample_idx][batch_idx].to(torch.bool).contiguous().clone()
+                )
             else:
                 batch_negative_text_hidden_state = None
                 batch_negative_text_attention_mask = None
@@ -555,11 +596,15 @@ def sample_reference_model(
             batch_ref_latent = [ref_latent[i] for i in batch_indices_list]
             batch_edit_prompt = [edit_prompt_list[int(i)] for i in batch_indices_list]
             if not args.init_same_noise:
-                input_latents = torch.randn(
+                input_latents = (
+                    torch.randn(
                         (len(batch_idx), IN_CHANNELS, latent_w, latent_h),
                         device=device,
                         dtype=torch.bfloat16,
-                    ).contiguous().clone()
+                    )
+                    .contiguous()
+                    .clone()
+                )
 
             grpo_sample = True
             if args.show_progress_bar:
@@ -580,8 +625,12 @@ def sample_reference_model(
                     freqs_cis,
                     grpo_sample,
                     generators=None,
-                    negative_text_hidden_states=(batch_negative_text_hidden_state if batch_negative_text_hidden_state is not None else None),
-                    negative_text_attention_mask=(batch_negative_text_attention_mask if batch_negative_text_attention_mask is not None else None),
+                    negative_text_hidden_states=(
+                        batch_negative_text_hidden_state if batch_negative_text_hidden_state is not None else None
+                    ),
+                    negative_text_attention_mask=(
+                        batch_negative_text_attention_mask if batch_negative_text_attention_mask is not None else None
+                    ),
                     sde_sample=True,
                 )
 
@@ -592,8 +641,8 @@ def sample_reference_model(
                 with torch.autocast("npu", dtype=torch.bfloat16):
                     # Use VAE config scaling/shift if available; otherwise, do not alter latents
                     latents_to_decode = latents
-                    scaling_factor = getattr(vae.config, 'scaling_factor', None)
-                    shift_factor = getattr(vae.config, 'shift_factor', None)
+                    scaling_factor = getattr(vae.config, "scaling_factor", None)
+                    shift_factor = getattr(vae.config, "shift_factor", None)
                     if scaling_factor is not None:
                         latents_to_decode = latents_to_decode / scaling_factor
                     if shift_factor is not None:
@@ -609,10 +658,10 @@ def sample_reference_model(
             end_time = time.time()
             if rank == 0:
                 print(f"[Sampling] Batch {index} time: {end_time - start_time}")
-            
+
             prompts = batch_edit_prompt
             images = [[ref_image, _decoded_image] for _decoded_image in decoded_image]
-            
+
             args_tuple = (prompts, images)
             reward_futures.append(pool.apply_async(calculate_rewards_async, (args_tuple,)))
 
@@ -625,24 +674,39 @@ def sample_reference_model(
                 prompt_following = float(meta.get("prompt_following", 0.0))
                 consistency = float(meta.get("consistency", 0.0))
                 perceptual = float(meta.get("perceptual_quality", 0.0))
-                prompt_following_rewards.append(torch.tensor(prompt_following, device=device, dtype=torch.float32).unsqueeze(0))
+                prompt_following_rewards.append(
+                    torch.tensor(prompt_following, device=device, dtype=torch.float32).unsqueeze(0)
+                )
                 consistency_rewards.append(torch.tensor(consistency, device=device, dtype=torch.float32).unsqueeze(0))
-                perceptual_quality_rewards.append(torch.tensor(perceptual, device=device, dtype=torch.float32).unsqueeze(0))
+                perceptual_quality_rewards.append(
+                    torch.tensor(perceptual, device=device, dtype=torch.float32).unsqueeze(0)
+                )
 
         _all_latents = torch.cat(_all_latents, dim=0)
         _all_log_probs = torch.cat(_all_log_probs, dim=0)
         _all_rewards = torch.cat(_all_rewards, dim=0)
-        
+
         all_latents.append(_all_latents)
         all_log_probs.append(_all_log_probs)
         all_rewards.append(_all_rewards)
-    
+
     # Concatenate per-component rewards if collected; otherwise set to None
     prompt_following_rewards = torch.cat(prompt_following_rewards, dim=0) if len(prompt_following_rewards) > 0 else None
     consistency_rewards = torch.cat(consistency_rewards, dim=0) if len(consistency_rewards) > 0 else None
-    perceptual_quality_rewards = torch.cat(perceptual_quality_rewards, dim=0) if len(perceptual_quality_rewards) > 0 else None
+    perceptual_quality_rewards = (
+        torch.cat(perceptual_quality_rewards, dim=0) if len(perceptual_quality_rewards) > 0 else None
+    )
 
-    return all_rewards, all_latents, all_log_probs, sigma_schedule, prompt_following_rewards, consistency_rewards, perceptual_quality_rewards, None
+    return (
+        all_rewards,
+        all_latents,
+        all_log_probs,
+        sigma_schedule,
+        prompt_following_rewards,
+        consistency_rewards,
+        perceptual_quality_rewards,
+        None,
+    )
 
 
 def gather_tensor(tensor):
@@ -684,9 +748,23 @@ def train_one_step(
     if isinstance(batch, (list, tuple)):
         # Support both no-CFG (3-tuple) and CFG (6-tuple) collate outputs
         if len(batch) == 7:
-            encoder_hidden_states, text_attention_masks, ref_latents, negative_text_hidden_states, negative_text_attention_masks, edit_prompts, ref_images = batch
+            (
+                encoder_hidden_states,
+                text_attention_masks,
+                ref_latents,
+                negative_text_hidden_states,
+                negative_text_attention_masks,
+                edit_prompts,
+                ref_images,
+            ) = batch
         elif len(batch) >= 4:
-            encoder_hidden_states, text_attention_masks, ref_latents, edit_prompts, ref_images = batch[0], batch[1], batch[2], batch[3], batch[4]
+            encoder_hidden_states, text_attention_masks, ref_latents, edit_prompts, ref_images = (
+                batch[0],
+                batch[1],
+                batch[2],
+                batch[3],
+                batch[4],
+            )
         else:
             raise ValueError("Dataloader must return 3 or 6 items depending on CFG mode")
     elif isinstance(batch, dict):
@@ -696,9 +774,14 @@ def train_one_step(
         edit_prompts = batch.get("edit_prompts")
         # Optional negatives for CFG
         negative_text_hidden_states = batch.get("negative_prompt_embed") or batch.get("negative_encoder_hidden_states")
-        negative_text_attention_masks = batch.get("negative_prompt_attention_mask") or batch.get("negative_text_attention_mask")
+        negative_text_attention_masks = batch.get("negative_prompt_attention_mask") or batch.get(
+            "negative_text_attention_mask"
+        )
         if encoder_hidden_states is None or text_attention_masks is None or edit_prompts is None:
-            raise ValueError("Dataloader dict must include prompt_embed/encoder_hidden_states, prompt_attention_mask/text_attention_mask, caption/captions")
+            raise ValueError(
+                "Dataloader dict must include prompt_embed/encoder_hidden_states, "
+                "prompt_attention_mask/text_attention_mask, caption/captions"
+            )
     else:
         # Assume a simple 3-tuple like object
         try:
@@ -707,43 +790,81 @@ def train_one_step(
             raise ValueError(f"Unsupported dataloader batch format: {type(batch)}") from e
 
     if args.use_group:
+
         def repeat_tensor(tensor):
             if tensor is None:
                 return None
             return torch.repeat_interleave(tensor, args.num_generations, dim=0)
-        encoder_hidden_states = [repeat_tensor(_encoder_hidden_states) for _encoder_hidden_states in encoder_hidden_states]
+
+        encoder_hidden_states = [
+            repeat_tensor(_encoder_hidden_states) for _encoder_hidden_states in encoder_hidden_states
+        ]
         text_attention_masks = [repeat_tensor(_text_attention_masks) for _text_attention_masks in text_attention_masks]
         if negative_text_hidden_states is not None:
-            negative_text_hidden_states = [repeat_tensor(_negative_text_hidden_states) for _negative_text_hidden_states in negative_text_hidden_states]
+            negative_text_hidden_states = [
+                repeat_tensor(_negative_text_hidden_states)
+                for _negative_text_hidden_states in negative_text_hidden_states
+            ]
         else:
             negative_text_hidden_states = [None] * len(encoder_hidden_states)
         if negative_text_attention_masks is not None:
-            negative_text_attention_masks = [repeat_tensor(_negative_text_attention_masks) for _negative_text_attention_masks in negative_text_attention_masks]
+            negative_text_attention_masks = [
+                repeat_tensor(_negative_text_attention_masks)
+                for _negative_text_attention_masks in negative_text_attention_masks
+            ]
         else:
             negative_text_attention_masks = [None] * len(encoder_hidden_states)
         ref_latents = [inner_list * args.num_generations for inner_list in ref_latents]
 
     # text_attention_mask 已由数据集提供
-    rewards, all_latents, all_log_probs, sigma_schedule, prompt_following_rewards, consistency_rewards, perceptual_quality_rewards, _ = sample_reference_model(
-            args,
-            device, 
-            transformer,
-            vae,
-            encoder_hidden_states, 
-            text_attention_masks,
-            ref_latents,
-            tokenizer,
-            edit_prompts,
-            preprocess_val,
-            images_dir,
-            args.sample_batch_size,
-            ref_images=ref_images,
-            negative_text_hidden_states=negative_text_hidden_states,
-            negative_text_attention_masks=negative_text_attention_masks,
-        )
+    (
+        rewards,
+        all_latents,
+        all_log_probs,
+        sigma_schedule,
+        prompt_following_rewards,
+        consistency_rewards,
+        perceptual_quality_rewards,
+        _,
+    ) = sample_reference_model(
+        args,
+        device,
+        transformer,
+        vae,
+        encoder_hidden_states,
+        text_attention_masks,
+        ref_latents,
+        tokenizer,
+        edit_prompts,
+        preprocess_val,
+        images_dir,
+        args.sample_batch_size,
+        ref_images=ref_images,
+        negative_text_hidden_states=negative_text_hidden_states,
+        negative_text_attention_masks=negative_text_attention_masks,
+    )
 
     all_gathered_reward = []
-    for reward, latents, log_probs, encoder_hidden_state, text_attention_mask, negative_text_hidden_state, negative_text_attention_mask, ref_latent in zip(rewards, all_latents, all_log_probs, encoder_hidden_states, text_attention_masks, negative_text_hidden_states, negative_text_attention_masks, ref_latents):
+    for (
+        reward,
+        latents,
+        log_probs,
+        encoder_hidden_state,
+        text_attention_mask,
+        negative_text_hidden_state,
+        negative_text_attention_mask,
+        ref_latent,
+    ) in zip(
+        rewards,
+        all_latents,
+        all_log_probs,
+        encoder_hidden_states,
+        text_attention_masks,
+        negative_text_hidden_states,
+        negative_text_attention_masks,
+        ref_latents,
+        strict=True,
+    ):
         batch_size = latents.shape[0]
 
         gathered_reward = gather_tensor(reward)
@@ -757,12 +878,14 @@ def train_one_step(
             else:
                 all_advantages[:] = (reward - group_mean) / group_std
         else:
-            all_advantages = (reward - gathered_reward.mean())/(gathered_reward.std()+1e-8)
-    
-        timestep_values = [int((t.item() if torch.is_tensor(t) else float(t)) * 1000) for t in sigma_schedule][:args.sampling_steps]
+            all_advantages = (reward - gathered_reward.mean()) / (gathered_reward.std() + 1e-8)
+
+        timestep_values = [int((t.item() if torch.is_tensor(t) else float(t)) * 1000) for t in sigma_schedule][
+            : args.sampling_steps
+        ]
         device = latents.device
         timesteps = torch.tensor(timestep_values, device=latents.device, dtype=torch.long)
-        
+
         train_timesteps = random.sample(range(len(timestep_values)), int(len(timestep_values) * args.timestep_fraction))
         grpo_batch_size = args.grpo_batch_size
 
@@ -776,8 +899,12 @@ def train_one_step(
                 log_probs_chunk = log_probs[batch_idx]
                 encoder_hidden_state_chunk = encoder_hidden_state[batch_idx]
                 text_attention_mask_chunk = text_attention_mask[batch_idx]
-                negative_text_hidden_state_chunk = negative_text_hidden_state[batch_idx] if negative_text_hidden_state is not None else None
-                negative_text_attention_mask_chunk = negative_text_attention_mask[batch_idx] if negative_text_attention_mask is not None else None
+                negative_text_hidden_state_chunk = (
+                    negative_text_hidden_state[batch_idx] if negative_text_hidden_state is not None else None
+                )
+                negative_text_attention_mask_chunk = (
+                    negative_text_attention_mask[batch_idx] if negative_text_attention_mask is not None else None
+                )
                 ref_latent_chunk = [ref_latent[_index] for _index in batch_idx_list]
 
                 current_latents = latents_chunk[:, timestep_index]
@@ -790,7 +917,7 @@ def train_one_step(
                     encoder_hidden_state_chunk,
                     text_attention_mask_chunk,
                     transformer,
-                    timesteps[timestep_index:timestep_index+1],
+                    timesteps[timestep_index : timestep_index + 1],
                     sigma_schedule,  # continuous extended timesteps returned from sampler
                     timestep_index,
                     ref_latent_chunk,
@@ -798,33 +925,38 @@ def train_one_step(
                     negative_text_attention_mask=negative_text_attention_mask_chunk,
                 )
 
-                
                 if transformer_ref is not None:
                     with torch.no_grad():
                         new_log_probs_ref, prev_sample_mean_ref, std_dev_t_ref = grpo_one_step(
                             args,
-                        current_latents,
-                        next_latents,
-                        encoder_hidden_state_chunk,
-                        text_attention_mask_chunk,
-                        transformer,
-                        timesteps[timestep_index:timestep_index+1],
-                        sigma_schedule,  # continuous extended timesteps returned from sampler
-                        timestep_index,
-                        ref_latent_chunk,
-                        negative_text_hidden_states=negative_text_hidden_state_chunk,
-                        negative_text_attention_mask=negative_text_attention_mask_chunk,
-                    )
-                
-                advantages = torch.clamp(all_advantages[batch_idx], -adv_clip_max, adv_clip_max,)
+                            current_latents,
+                            next_latents,
+                            encoder_hidden_state_chunk,
+                            text_attention_mask_chunk,
+                            transformer,
+                            timesteps[timestep_index : timestep_index + 1],
+                            sigma_schedule,  # continuous extended timesteps returned from sampler
+                            timestep_index,
+                            ref_latent_chunk,
+                            negative_text_hidden_states=negative_text_hidden_state_chunk,
+                            negative_text_attention_mask=negative_text_attention_mask_chunk,
+                        )
+
+                advantages = torch.clamp(
+                    all_advantages[batch_idx],
+                    -adv_clip_max,
+                    adv_clip_max,
+                )
 
                 ratio = torch.exp(new_log_probs - log_probs_chunk[:, timestep_index])
                 unclipped_loss = -advantages * ratio
 
                 policy_loss = torch.mean(unclipped_loss) / (len(rewards) * len(batch_indices) * len(train_timesteps))
-                
+
                 if transformer_ref is not None:
-                    kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2), keepdim=True) / (2 * std_dev_t ** 2)
+                    kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1, 2), keepdim=True) / (
+                        2 * std_dev_t**2
+                    )
                     kl_loss = torch.mean(kl_loss)
                     loss = policy_loss + args.kl_beta * kl_loss
                 else:
@@ -845,7 +977,13 @@ def train_one_step(
                     total_kl_loss += avg_kl_loss.item()
             end_time = time.time()
             if rank == 0:
-                print(f"Step {i+1}/{len(train_timesteps)}: Loss {total_loss:.4f}, Policy Loss {total_policy_loss:.4f}, total_kl_loss {total_kl_loss:.4f}, Time {end_time - start_time:.4f}")
+                print(
+                    f"Step {i + 1}/{len(train_timesteps)}: "
+                    f"Loss {total_loss:.4f}, "
+                    f"Policy Loss {total_policy_loss:.4f}, "
+                    f"total_kl_loss {total_kl_loss:.4f}, "
+                    f"Time {end_time - start_time:.4f}"
+                )
 
     grad_norm_val = transformer.clip_grad_norm_(max_grad_norm)
     optimizer.step()
@@ -859,7 +997,7 @@ def train_one_step(
             gathered_prompt_following_rewards = gather_tensor(prompt_following_rewards)
             gathered_consistency_rewards = gather_tensor(consistency_rewards)
             gathered_perceptual_quality_rewards = gather_tensor(perceptual_quality_rewards)
-        except:
+        except Exception:
             gathered_prompt_following_rewards = None
             gathered_consistency_rewards = None
             gathered_perceptual_quality_rewards = None
@@ -870,27 +1008,33 @@ def train_one_step(
         "reward_max": gathered_reward.max().item(),
     }
     if args.editscore_reward and gathered_prompt_following_rewards is not None:
-        reward_stats.update({
-            "prompt_following_mean": gathered_prompt_following_rewards.mean().item(),
-            "prompt_following_std": gathered_prompt_following_rewards.std().item(),
-            "prompt_following_min": gathered_prompt_following_rewards.min().item(),
-            "prompt_following_max": gathered_prompt_following_rewards.max().item(),
-        })
+        reward_stats.update(
+            {
+                "prompt_following_mean": gathered_prompt_following_rewards.mean().item(),
+                "prompt_following_std": gathered_prompt_following_rewards.std().item(),
+                "prompt_following_min": gathered_prompt_following_rewards.min().item(),
+                "prompt_following_max": gathered_prompt_following_rewards.max().item(),
+            }
+        )
     if args.editscore_reward and gathered_consistency_rewards is not None:
-        reward_stats.update({
-            "consistency_mean": gathered_consistency_rewards.mean().item(),
-            "consistency_std": gathered_consistency_rewards.std().item(),
-            "consistency_min": gathered_consistency_rewards.min().item(),
-            "consistency_max": gathered_consistency_rewards.max().item(),
-        })
+        reward_stats.update(
+            {
+                "consistency_mean": gathered_consistency_rewards.mean().item(),
+                "consistency_std": gathered_consistency_rewards.std().item(),
+                "consistency_min": gathered_consistency_rewards.min().item(),
+                "consistency_max": gathered_consistency_rewards.max().item(),
+            }
+        )
     if args.editscore_reward and gathered_perceptual_quality_rewards is not None:
-        reward_stats.update({
-            "perceptual_quality_mean": gathered_perceptual_quality_rewards.mean().item(),
-            "perceptual_quality_std": gathered_perceptual_quality_rewards.std().item(),
-            "perceptual_quality_min": gathered_perceptual_quality_rewards.min().item(),
-            "perceptual_quality_max": gathered_perceptual_quality_rewards.max().item(),
-        })
-    
+        reward_stats.update(
+            {
+                "perceptual_quality_mean": gathered_perceptual_quality_rewards.mean().item(),
+                "perceptual_quality_std": gathered_perceptual_quality_rewards.std().item(),
+                "perceptual_quality_min": gathered_perceptual_quality_rewards.min().item(),
+                "perceptual_quality_max": gathered_perceptual_quality_rewards.max().item(),
+            }
+        )
+
     return total_loss, grad_norm_val.item(), reward_stats, total_policy_loss, total_kl_loss
 
 
@@ -910,11 +1054,8 @@ def main(args):
 
     # Hybrid reward only arguments
     assert args.use_hybrid_reward, "This script only supports --use_hybrid_reward mode."
-    reward_model = create_editscore_reward_model(
-        psm=args.editscore_psm,
-        num_pass=args.editscore_num_pass)
     preprocess_val = None
-    main_print(f"--> Reward model initialized: EditScoreRewardModel")
+    main_print("--> Reward model initialized: EditScoreRewardModel")
     main_print(f"--> loading Mammoth2 model from {args.pretrained_model_name_or_path}")
 
     # Load transformer in Mammoth style (aligned with embedding preprocessing)
@@ -996,19 +1137,24 @@ def main(args):
     if ckpt_path is not None and os.path.exists(ckpt_path):
         try:
             from safetensors.torch import load_file as safe_load_file
-            state = safe_load_file(ckpt_path) if ckpt_path.endswith(".safetensors") else torch.load(ckpt_path, map_location="cpu")
+
+            state = (
+                safe_load_file(ckpt_path)
+                if ckpt_path.endswith(".safetensors")
+                else torch.load(ckpt_path, map_location="cpu")
+            )
         except Exception:
             state = torch.load(ckpt_path, map_location="cpu")
         if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
             state = state["model"]
-        transformer_state = {k[len("transformer."):]: v for k, v in state.items() if k.startswith("transformer.")}
+        transformer_state = {k[len("transformer.") :]: v for k, v in state.items() if k.startswith("transformer.")}
         missing_keys, unexpected_keys = transformer.load_state_dict(transformer_state, strict=False)
         main_print(f"--> Loaded transformer weights from unified checkpoint: {ckpt_path}")
         if len(missing_keys) > 0:
             main_print(f"--> Missing transformer keys: {len(missing_keys)}")
         if len(unexpected_keys) > 0:
             main_print(f"--> Unexpected transformer keys: {len(unexpected_keys)}")
-        
+
         if transformer_ref is not None:
             missing_keys_ref, unexpected_keys_ref = transformer_ref.load_state_dict(transformer_state, strict=False)
             if len(missing_keys_ref) > 0:
@@ -1016,7 +1162,9 @@ def main(args):
             if len(unexpected_keys_ref) > 0:
                 main_print(f"--> Unexpected transformer_ref keys: {len(unexpected_keys_ref)}")
     else:
-        main_print("--> Warning: unified_model_path not provided/found; using randomly initialized transformer per config")
+        main_print(
+            "--> Warning: unified_model_path not provided/found; using randomly initialized transformer per config"
+        )
 
     # Ensure gradient checkpointing hook is installed inside the model before FSDP wrapping
     if args.gradient_checkpointing:
@@ -1028,11 +1176,23 @@ def main(args):
     # Diagnostics: print transformer config and lightweight param stats (rank 0)
     try:
         if dist.get_rank() == 0:
-            main_print(f"--> Transformer config: hidden_size={transformer.config.hidden_size}, layers={transformer.config.num_layers}, heads={transformer.config.num_attention_heads}, text_feat_dim={transformer.config.text_feat_dim}")
-            main_print(f"--> RoPE axes_dim={transformer.config.axes_dim_rope}, axes_lens={transformer.config.axes_lens}")
+            main_print(
+                f"--> Transformer config: "
+                f"hidden_size={transformer.config.hidden_size}, "
+                f"layers={transformer.config.num_layers}, "
+                f"heads={transformer.config.num_attention_heads}, "
+                f"text_feat_dim={transformer.config.text_feat_dim}"
+            )
+            main_print(
+                f"--> RoPE axes_dim={transformer.config.axes_dim_rope}, axes_lens={transformer.config.axes_lens}"
+            )
             trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
             first_param = next(transformer.parameters())
-            main_print(f"--> Trainable params: {trainable_params/1e6:.2f}M, dtype={first_param.dtype}, abs-mean={first_param.detach().abs().mean().item():.6f}")
+            main_print(
+                f"--> Trainable params: {trainable_params / 1e6:.2f}M, "
+                f"dtype={first_param.dtype}, "
+                f"abs-mean={first_param.detach().abs().mean().item():.6f}"
+            )
     except Exception:
         pass
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
@@ -1042,38 +1202,39 @@ def main(args):
         args.use_cpu_offload,
         args.master_weight_type,
     )
-    transformer = FSDP(transformer, **fsdp_kwargs,)
+    transformer = FSDP(
+        transformer,
+        **fsdp_kwargs,
+    )
     if transformer_ref is not None:
-        transformer_ref = FSDP(transformer_ref, **fsdp_kwargs,)
+        transformer_ref = FSDP(
+            transformer_ref,
+            **fsdp_kwargs,
+        )
     ema_handler = None
     if args.use_ema:
         ema_handler = FSDP_EMA(transformer, args.ema_decay, rank)
 
     if args.gradient_checkpointing:
-        apply_fsdp_checkpointing(
-            transformer, no_split_modules, args.selective_checkpointing
-        )
+        apply_fsdp_checkpointing(transformer, no_split_modules, args.selective_checkpointing)
 
     vae = AutoencoderKL.from_pretrained(
         args.vae_model_path,
         subfolder="vae",
-        torch_dtype = torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     ).to(device)
     try:
         if dist.get_rank() == 0:
-            vae_in = getattr(vae.config, 'in_channels', None)
-            vae_sf = getattr(vae, 'scaling_factor', getattr(vae.config, 'scaling_factor', None))
-            vae_shift = getattr(vae, 'shift_factor', getattr(vae.config, 'shift_factor', None))
+            vae_in = getattr(vae.config, "in_channels", None)
+            vae_sf = getattr(vae, "scaling_factor", getattr(vae.config, "scaling_factor", None))
+            vae_shift = getattr(vae, "shift_factor", getattr(vae.config, "shift_factor", None))
             main_print(f"--> VAE: in_channels={vae_in}, scaling_factor={vae_sf}, shift_factor={vae_shift}")
     except Exception:
         pass
-    main_print(
-        f"--> Initializing FSDP with sharding strategy: {args.fsdp_sharding_startegy}"
-    )
+    main_print(f"--> Initializing FSDP with sharding strategy: {args.fsdp_sharding_startegy}")
     transformer.train()
     if transformer_ref is not None:
         transformer_ref.eval()
-    noise_scheduler = None
     params_to_optimize = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     optimizer = torch.optim.AdamW(
         params_to_optimize,
@@ -1099,8 +1260,8 @@ def main(args):
         use_negative=bool(getattr(args, "use_negative_cfg", 1)),
     )
     sampler = DistributedSampler(
-            train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
-        )
+        train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
+    )
     train_dataloader = DataLoader(
         train_dataset,
         sampler=sampler,
@@ -1112,6 +1273,7 @@ def main(args):
     )
 
     project = "mammoth2.0_exp_npu"
+
     def generate_experiment_name(args, world_size):
         name_parts = []
         name_parts.append("m2")
@@ -1131,7 +1293,7 @@ def main(args):
         if args.h and args.w:
             name_parts.append(f"{args.h}x{args.w}")
         return "_".join(name_parts)
-    
+
     experiment_name = generate_experiment_name(args, world_size)
     main_print(f"--> Experiment name: {experiment_name}")
     if args.output_dir is not None:
@@ -1140,7 +1302,7 @@ def main(args):
         main_print(f"--> Original output_dir: {original_output_dir}")
         main_print(f"--> Modified output_dir: {args.output_dir}")
         os.makedirs(args.output_dir, exist_ok=True)
-        
+
     if dist.get_rank() == 0:
         wandb_config = {
             "model": "Mammoth2",
@@ -1164,19 +1326,16 @@ def main(args):
             "final_output_dir": args.output_dir,
         }
         try:
-            wandb.init(project=project,   
-                    name=experiment_name,
-                    config=wandb_config,
-                    )
+            wandb.init(
+                project=project,
+                name=experiment_name,
+                config=wandb_config,
+            )
         except Exception as e:
             print(f"Error initializing wandb: {e}")
-                    
+
     total_batch_size = (
-        args.train_batch_size
-        * world_size
-        * args.gradient_accumulation_steps
-        / args.sp_size
-        * args.train_sp_batch_size
+        args.train_batch_size * world_size * args.gradient_accumulation_steps / args.sp_size * args.train_sp_batch_size
     )
     main_print("***** Running training *****")
     main_print(f"  Num examples = {len(train_dataset)}")
@@ -1186,7 +1345,10 @@ def main(args):
     main_print(f"  Total train batch size (w. data & sequence parallel, accumulation) = {total_batch_size}")
     main_print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     main_print(f"  Total optimization steps per epoch = {args.max_train_steps}")
-    main_print(f"  Total training parameters per FSDP shard = {sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e9} B")
+    main_print(
+        f"  Total training parameters per FSDP shard = "
+        f"{sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e9} B"
+    )
     main_print(f"  Master weight dtype: {transformer.parameters().__next__().dtype}")
 
     if args.resume_from_checkpoint:
@@ -1214,18 +1376,17 @@ def main(args):
         if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(epoch)
 
-        for step in range(init_steps+1, args.max_train_steps+1):
+        for step in range(init_steps + 1, args.max_train_steps + 1):
             start_time = time.time()
             if step % args.checkpointing_steps == 0:
-                save_checkpoint(transformer, rank, args.output_dir,
-                                step, epoch)
+                save_checkpoint(transformer, rank, args.output_dir, step, epoch)
                 if args.use_ema and ema_handler:
                     save_ema_checkpoint(ema_handler, rank, args.output_dir, step, epoch, dict(transformer.config))
                 dist.barrier()
 
             loss, grad_norm, reward_stats, policy_loss, kl_loss = train_one_step(
                 args,
-                device, 
+                device,
                 transformer,
                 vae,
                 None,
@@ -1249,7 +1410,7 @@ def main(args):
             step_time = time.time() - start_time
             step_times.append(step_time)
             avg_step_time = sum(step_times) / len(step_times)
-    
+
             progress_bar.set_postfix(
                 {
                     "loss": f"{loss:.4f}",
@@ -1276,26 +1437,32 @@ def main(args):
                 }
                 # If hybrid reward components exist, include their stats (align with train_grpo_flux_hybrid)
                 if args.editscore_reward and "prompt_following_mean" in reward_stats:
-                    log_data.update({
-                        "prompt_following_mean": reward_stats["prompt_following_mean"],
-                        "prompt_following_std": reward_stats["prompt_following_std"],
-                        "prompt_following_min": reward_stats["prompt_following_min"],
-                        "prompt_following_max": reward_stats["prompt_following_max"],
-                    })
+                    log_data.update(
+                        {
+                            "prompt_following_mean": reward_stats["prompt_following_mean"],
+                            "prompt_following_std": reward_stats["prompt_following_std"],
+                            "prompt_following_min": reward_stats["prompt_following_min"],
+                            "prompt_following_max": reward_stats["prompt_following_max"],
+                        }
+                    )
                 if args.editscore_reward and "consistency_mean" in reward_stats:
-                    log_data.update({
-                        "consistency_mean": reward_stats["consistency_mean"],
-                        "consistency_std": reward_stats["consistency_std"],
-                        "consistency_min": reward_stats["consistency_min"],
-                        "consistency_max": reward_stats["consistency_max"],
-                    })
+                    log_data.update(
+                        {
+                            "consistency_mean": reward_stats["consistency_mean"],
+                            "consistency_std": reward_stats["consistency_std"],
+                            "consistency_min": reward_stats["consistency_min"],
+                            "consistency_max": reward_stats["consistency_max"],
+                        }
+                    )
                 if args.editscore_reward and "perceptual_quality_mean" in reward_stats:
-                    log_data.update({
-                        "perceptual_quality_mean": reward_stats["perceptual_quality_mean"],
-                        "perceptual_quality_std": reward_stats["perceptual_quality_std"],
-                        "perceptual_quality_min": reward_stats["perceptual_quality_min"],
-                        "perceptual_quality_max": reward_stats["perceptual_quality_max"],
-                    })
+                    log_data.update(
+                        {
+                            "perceptual_quality_mean": reward_stats["perceptual_quality_mean"],
+                            "perceptual_quality_std": reward_stats["perceptual_quality_std"],
+                            "perceptual_quality_min": reward_stats["perceptual_quality_min"],
+                            "perceptual_quality_max": reward_stats["perceptual_quality_max"],
+                        }
+                    )
                 wandb.log(log_data, step=step)
 
     if get_sequence_parallel_state():
@@ -1309,7 +1476,9 @@ if __name__ == "__main__":
         "--dataloader_num_workers",
         type=int,
         default=10,
-        help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
+        help=(
+            "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
+        ),
     )
     parser.add_argument(
         "--train_batch_size",
@@ -1325,26 +1494,33 @@ if __name__ == "__main__":
     )
     parser.add_argument("--pretrained_model_name_or_path", type=str)
     parser.add_argument("--unified_model_config", type=str, default=None, help="Path to Mammoth unified config.yml")
-    parser.add_argument("--unified_model_path", type=str, default=None, help="Path to unified model weights (.safetensors/.bin)")
+    parser.add_argument(
+        "--unified_model_path", type=str, default=None, help="Path to unified model weights (.safetensors/.bin)"
+    )
     parser.add_argument("--dit_model_name_or_path", type=str, default=None)
     parser.add_argument("--vae_model_path", type=str, default=None, help="vae model.")
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
     parser.add_argument("--ema_decay", type=float, default=0.995)
     parser.add_argument("--ema_start_step", type=int, default=0)
     # CFG options (align with sampling script)
-    parser.add_argument("--use_negative_cfg", action="store_true", default=False, help="Enable CFG using negative embeddings/masks from dataset")
+    parser.add_argument(
+        "--use_negative_cfg",
+        action="store_true",
+        default=False,
+        help="Enable CFG using negative embeddings/masks from dataset",
+    )
     parser.add_argument("--cfg_rate", type=float, default=0.0, help="CFG rate in dataset")
     parser.add_argument("--cfg_scale", type=float, default=5.0, help="CFG scale used when --use_negative_cfg is on")
-    parser.add_argument("--cfg_scale_image", type=float, default=2.0, help="CFG scale used when --use_negative_cfg is on for image")
+    parser.add_argument(
+        "--cfg_scale_image", type=float, default=2.0, help="CFG scale used when --use_negative_cfg is on for image"
+    )
 
     parser.add_argument(
         "--precondition_outputs",
         action="store_true",
         help="Whether to precondition the outputs of the model.",
     )
-    parser.add_argument(
-        "--seed", type=int, default=None, help="A seed for reproducible training."
-    )
+    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -1403,9 +1579,7 @@ if __name__ == "__main__":
         default=10,
         help="Number of steps for the warmup in the lr scheduler.",
     )
-    parser.add_argument(
-        "--max_grad_norm", default=2.0, type=float, help="Max gradient norm."
-    )
+    parser.add_argument("--max_grad_norm", default=2.0, type=float, help="Max gradient norm.")
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
@@ -1464,9 +1638,7 @@ if __name__ == "__main__":
         default=1.0,
         help="Power factor of the polynomial scheduler.",
     )
-    parser.add_argument(
-        "--weight_decay", type=float, default=0.01, help="Weight decay to apply."
-    )
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay to apply.")
     parser.add_argument(
         "--master_weight_type",
         type=str,
@@ -1476,43 +1648,43 @@ if __name__ == "__main__":
     parser.add_argument(
         "--h",
         type=int,
-        default=None,   
+        default=None,
         help="video height",
     )
     parser.add_argument(
         "--w",
         type=int,
-        default=None,   
+        default=None,
         help="video width",
     )
     parser.add_argument(
         "--t",
         type=int,
-        default=None,   
+        default=None,
         help="video length",
     )
     parser.add_argument(
         "--sampling_steps",
         type=int,
-        default=None,   
+        default=None,
         help="sampling steps",
     )
     parser.add_argument(
         "--eta",
         type=float,
-        default=None,   
+        default=None,
         help="noise eta",
     )
     parser.add_argument(
         "--sampler_seed",
         type=int,
-        default=None,   
+        default=None,
         help="seed of sampler",
     )
     parser.add_argument(
         "--loss_coef",
         type=float,
-        default=1.0,   
+        default=1.0,
         help="the global loss should be divided by",
     )
     parser.add_argument(
@@ -1524,7 +1696,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_generations",
         type=int,
-        default=16,   
+        default=16,
         help="num_generations per prompt",
     )
     parser.add_argument(
@@ -1595,33 +1767,29 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--shift",
-        type = float,
+        type=float,
         default=1.0,
         help="shift for timestep scheduler",
     )
     parser.add_argument(
         "--timestep_fraction",
-        type = float,
+        type=float,
         default=1.0,
         help="timestep downsample ratio",
     )
     parser.add_argument(
         "--clip_range",
-        type = float,
+        type=float,
         default=1e-4,
         help="clip range for grpo",
     )
     parser.add_argument(
         "--adv_clip_max",
-        type = float,
+        type=float,
         default=5.0,
         help="clipping advantage",
     )
-    parser.add_argument(
-        "--use_ema", 
-        action="store_true", 
-        help="Enable Exponential Moving Average of model weights."
-    )
+    parser.add_argument("--use_ema", action="store_true", help="Enable Exponential Moving Average of model weights.")
     parser.add_argument(
         "--show_progress_bar",
         action="store_true",
@@ -1659,12 +1827,22 @@ if __name__ == "__main__":
         help="KL divergence beta for GRPO sampling",
     )
     # epsilon(t) scheduling for GRPO sampling
-    parser.add_argument("--eps_schedule", type=str, default="constant", choices=["constant", "linear", "cosine", "poly"], help="epsilon(t) schedule; front-big-later-small preferred")
+    parser.add_argument(
+        "--eps_schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear", "cosine", "poly"],
+        help="epsilon(t) schedule; front-big-later-small preferred",
+    )
     parser.add_argument("--eps_power", type=float, default=2.0, help="power for poly schedule: eps(t)=eta*(1-t)^power")
-    parser.add_argument("--eps_min_ratio", type=float, default=0.0, help="lower bound for epsilon scale to prevent vanishing noise")
+    parser.add_argument(
+        "--eps_min_ratio", type=float, default=0.0, help="lower bound for epsilon scale to prevent vanishing noise"
+    )
     # Hybrid reward only arguments
     parser.add_argument("--use_hybrid_reward", action="store_true", default=True)
-    parser.add_argument("--hpsv3_checkpoint_path", type=str, default="/mnt/bn/seutao-hl/DATA/ckpts/MizzenAI/HPSv3/HPSv3.safetensors")
+    parser.add_argument(
+        "--hpsv3_checkpoint_path", type=str, default="/mnt/bn/seutao-hl/DATA/ckpts/MizzenAI/HPSv3/HPSv3.safetensors"
+    )
     parser.add_argument("--hpsv3_weight", type=float, default=0.5)
     parser.add_argument("--ocr_weight", type=float, default=0.5)
     parser.add_argument("--doubao_weight", type=float, default=0.0)
@@ -1685,5 +1863,3 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args)
-
-

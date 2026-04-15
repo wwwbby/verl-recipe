@@ -38,9 +38,8 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 from einops import rearrange
 from loguru import logger
-from torch import nn
-
 from recipe.dance_grpo.mammothmoda2.model.mammothmoda2_qwen3_vl.modeling_mammothmoda2_qwen3_vl import Qwen3VLTextRMSNorm
+from torch import nn
 
 from .attention_processor import AttnProcessor, AttnProcessorFlash2Varlen
 from .block_lumina2 import (
@@ -427,7 +426,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
     ):
         batch_size = len(hidden_states)
         max_combined_img_len = max(
-            [img_len + sum(ref_img_len) for img_len, ref_img_len in zip(l_effective_img_len, l_effective_ref_img_len)]
+            [
+                img_len + sum(ref_img_len)
+                for img_len, ref_img_len in zip(l_effective_img_len, l_effective_ref_img_len, strict=True)
+            ]
         )
 
         hidden_states = self.x_embedder(hidden_states)
@@ -495,7 +497,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
                 idx += 1
 
         combined_img_hidden_states = hidden_states.new_zeros(batch_size, max_combined_img_len, self.config.hidden_size)
-        for i, (ref_img_len, img_len) in enumerate(zip(l_effective_ref_img_len, l_effective_img_len)):
+        for i, (ref_img_len, img_len) in enumerate(zip(l_effective_ref_img_len, l_effective_img_len, strict=True)):
             combined_img_hidden_states[i, : sum(ref_img_len)] = ref_image_hidden_states[i, : sum(ref_img_len)]
             combined_img_hidden_states[i, sum(ref_img_len) : sum(ref_img_len) + img_len] = hidden_states[i, :img_len]
 
@@ -624,7 +626,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
             text_hidden_states=text_hidden_states,
             ar_image_hidden_states=ar_image_hidden_states,
             ar_image_attention_mask=ar_image_attention_mask,
-            dtype=hidden_states[0].dtype
+            dtype=hidden_states[0].dtype,
         )
 
         if ar_image_hidden_states is not None:
@@ -686,7 +688,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
 
         attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
         joint_hidden_states = hidden_states.new_zeros(batch_size, max_seq_len, self.config.hidden_size)
-        for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths, strict=True)):
             attention_mask[i, :seq_len] = True
             joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
             joint_hidden_states[i, encoder_seq_len:seq_len] = combined_img_hidden_states[i, : seq_len - encoder_seq_len]
@@ -745,7 +747,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
 
         p = self.config.patch_size
         output = []
-        for i, (img_size, img_len, seq_len) in enumerate(zip(img_sizes, l_effective_img_len, seq_lengths)):
+        for i, (img_size, img_len, seq_len) in enumerate(zip(img_sizes, l_effective_img_len, seq_lengths, strict=True)):
             height, width = img_size
             output.append(
                 rearrange(

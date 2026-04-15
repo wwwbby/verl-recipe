@@ -190,7 +190,8 @@ class Mammothmoda2VAEImageProcessor(VaeImageProcessor):
                 # if image is a pytorch tensor could have 2 possible shapes:
                 #    1. batch x height x width: we should insert the channel dimension at position 1
                 #    2. channel x height x width: we should insert batch dimension at position 0,
-                #       however, since both channel and batch dimension has same size 1, it is same to insert at position 1
+                #       however, since both channel and batch dimension has same size 1,
+                #       it is same to insert at position 1
                 #    for simplicity, we insert a dimension of size 1 at position 1 for both cases
                 image = image.unsqueeze(1)
             else:
@@ -207,6 +208,7 @@ class Mammothmoda2VAEImageProcessor(VaeImageProcessor):
                 "Passing `image` as a list of 4d np.ndarray is deprecated."
                 "Please concatenate the list along the batch dimension and pass it as a single 4d np.ndarray",
                 FutureWarning,
+                stacklevel=2,
             )
             image = np.concatenate(image, axis=0)
         if isinstance(image, list) and isinstance(image[0], torch.Tensor) and image[0].ndim == 4:
@@ -214,12 +216,14 @@ class Mammothmoda2VAEImageProcessor(VaeImageProcessor):
                 "Passing `image` as a list of 4d torch.Tensor is deprecated."
                 "Please concatenate the list along the batch dimension and pass it as a single 4d torch.Tensor",
                 FutureWarning,
+                stacklevel=2,
             )
             image = torch.cat(image, axis=0)
 
         if not is_valid_image_imagelist(image):
             raise ValueError(
-                f"Input is in incorrect format. Currently, we only support {', '.join(str(x) for x in supported_formats)}"
+                f"Input is in incorrect format. Currently, we only support "
+                f"{', '.join(str(x) for x in supported_formats)}"
             )
         if not isinstance(image, list):
             image = [image]
@@ -265,9 +269,12 @@ class Mammothmoda2VAEImageProcessor(VaeImageProcessor):
         do_normalize = self.config.do_normalize
         if do_normalize and image.min() < 0:
             warnings.warn(
-                "Passing `image` as torch tensor with value range in [-1,1] is deprecated. The expected value range for image tensor is [0,1] "
-                f"when passing as pytorch tensor or numpy Array. You passed `image` with value range [{image.min()},{image.max()}]",
+                "Passing `image` as torch tensor with value range in [-1,1] is deprecated. "
+                "The expected value range for image tensor is [0,1] "
+                f"when passing as pytorch tensor or numpy Array. "
+                f"You passed `image` with value range [{image.min()},{image.max()}]",
                 FutureWarning,
+                stacklevel=2,
             )
             do_normalize = False
         if do_normalize:

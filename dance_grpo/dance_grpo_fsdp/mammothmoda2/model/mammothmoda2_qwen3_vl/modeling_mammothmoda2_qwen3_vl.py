@@ -25,7 +25,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -248,7 +248,7 @@ class Qwen3VLVisionAttention(nn.Module):
                     is_causal=False,
                     **kwargs,
                 )[0]
-                for q, k, v in zip(*splits)
+                for q, k, v in zip(*splits, strict=True)
             ]
             attn_output = torch.cat(attn_outputs, dim=1)
 
@@ -618,7 +618,8 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
 class Qwen3VLModelOutputWithPast(ModelOutput):
     r"""
     past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+        It is a [`~cache_utils.Cache`] instance. For more details, see our
+        [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
 
         Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
         `past_key_values` input) to speed up sequential decoding.
@@ -735,7 +736,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
 
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+        for t, h, w in zip(grid_ts, grid_hs, grid_ws, strict=True):
             h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
             w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
 
@@ -775,11 +776,11 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
-        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
+        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws, strict=True)])
 
         patch_pos_embeds_permute = []
         merge_size = self.config.spatial_merge_size
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws, strict=True):
             pos_embed = pos_embed.repeat(t, 1)
             pos_embed = (
                 pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
@@ -896,7 +897,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         gen_token_mask: Optional[torch.BoolTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[tuple, BaseModelOutputWithPast]:
+    ) -> tuple | BaseModelOutputWithPast:
         r"""
         visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
             The mask of the visual positions.
@@ -1054,7 +1055,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Different from the original implementation, Qwen3VL use timestamps rather than absolute time position ids."""
 
-        # Since we use timestamps to separate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split
+        # Since we use timestamps to separate videos, like
+        # <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>,
+        # the video_grid_thw should also be split
         if video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
             video_grid_thw[:, 0] = 1
@@ -1126,7 +1129,8 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                     llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
-                    # t_index is always 0 because llm_grid_t is always 1 (we use timestamps to encode the temporal information for videos)
+                    # t_index is always 0 because llm_grid_t is always 1
+                    # (we use timestamps to encode the temporal information for videos)
                     t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
                     h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
                     w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
@@ -1168,7 +1172,8 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None
     ):
         """
-        Encodes videos into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
+        Encodes videos into continuous embeddings that can be forwarded to the language model.
+        The deepstack visual features are also returned.
 
         Args:
             pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
@@ -1181,7 +1186,8 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
         """
-        Encodes images into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
+        Encodes images into continuous embeddings that can be forwarded to the language model.
+        The deepstack visual features are also returned.
 
         Args:
             pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
@@ -1203,8 +1209,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         video_features: Optional[torch.FloatTensor] = None,
     ):
         """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
+        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`,
+        and checks that the placeholder token count is equal to the length of multimodal features.
+        If the lengths are different, an error is raised.
         """
         if input_ids is None:
             special_image_mask = inputs_embeds == self.get_input_embeddings()(
@@ -1223,14 +1230,16 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
             raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, "
+                f"features {image_features.shape[0]}"
             )
 
         n_video_tokens = special_video_mask.sum()
         special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
             raise ValueError(
-                f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
+                f"Videos features and video tokens do not match: tokens: {n_video_tokens}, "
+                f"features {video_features.shape[0]}"
             )
 
         return special_image_mask, special_video_mask
@@ -1252,7 +1261,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         gen_token_mask: Optional[torch.BoolTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
+    ) -> tuple | Qwen3VLModelOutputWithPast:
         r"""
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
@@ -1306,7 +1315,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             deepstack_visual_embeds = []
             image_mask_joint = image_mask[visual_pos_masks]
             video_mask_joint = video_mask[visual_pos_masks]
-            for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
+            for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds, strict=True):
                 embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
                 embed_joint[image_mask_joint, :] = img_embed
                 embed_joint[video_mask_joint, :] = vid_embed
@@ -1399,7 +1408,8 @@ class Mammothmoda2Qwen3VLCausalLMOutputWithPast(ModelOutput):
     logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
         Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
     past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+        It is a [`~cache_utils.Cache`] instance. For more details, see our
+        [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
 
         Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
         `past_key_values` input) to speed up sequential decoding.
@@ -1481,11 +1491,11 @@ class Mammothmoda2Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, Genera
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: Optional[bool] = None,
         gen_token_mask: Optional[torch.BoolTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Mammothmoda2Qwen3VLCausalLMOutputWithPast]:
+    ) -> tuple | Mammothmoda2Qwen3VLCausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -1588,7 +1598,8 @@ class Mammothmoda2Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, Genera
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Get the number of images and videos for each sample to calculate the separation length of the sample tensor.
-        These parameters are not passed through the processor to avoid unpredictable impacts from interface modifications.
+        These parameters are not passed through the processor to avoid unpredictable impacts
+        from interface modifications.
 
         Args:
             input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):

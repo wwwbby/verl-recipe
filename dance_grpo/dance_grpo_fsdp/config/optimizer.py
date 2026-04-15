@@ -11,16 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import warnings
 from dataclasses import dataclass
-from typing import Optional
-from omegaconf import MISSING
-from verl.base_config import BaseConfig
-from verl.workers.config.optimizer import OptimizerConfig
+
 from verl.workers.config.optimizer import FSDPOptimizerConfig
-from verl.workers.config.optimizer import McoreOptimizerConfig
 
 __all__ = ["DiffusionFSDPOptimizerConfig"]
+
 
 @dataclass
 class DiffusionFSDPOptimizerConfig(FSDPOptimizerConfig):
@@ -36,7 +32,7 @@ class DiffusionFSDPOptimizerConfig(FSDPOptimizerConfig):
         num_cycles (float): Number of cosine cycles in LR schedule.
     """
 
-    lr_scheduler_name: str = 'cosine'
+    lr_scheduler_name: str = "cosine"
     lr_scheduler_num_warmup_steps: int = 1000
     lr_scheduler_num_training_steps: int = 10000
     lr_scheduler_num_cycles: int = 1
@@ -44,7 +40,6 @@ class DiffusionFSDPOptimizerConfig(FSDPOptimizerConfig):
 
     def __post_init__(self):
         return super().__post_init__()
-
 
 
 def build_optimizer(parameters, config: FSDPOptimizerConfig):

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import datetime
 import json
 import logging
@@ -25,48 +24,30 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.distributed as dist
+import torch.nn as nn
 from hpsv3 import HPSv3RewardInferencer
 from omegaconf import DictConfig
-from pandas.core.dtypes.cast import LossySetitemError
 from PIL import Image
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import StateDictType
-
 from recipe.dance_grpo.actor import DataParallelPPOActor
 from recipe.dance_grpo.rollout import HFRollout
-from recipe.dance_grpo.utils import init_fsdp_module
+from torch.distributed._composable.fsdp import CPUOffloadPolicy
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
+from transformers import AutoProcessor
+
 from verl import DataProto
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import (
-    Dispatch, make_nd_compute_dataproto_dispatch_fn, register)
-from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from verl.utils.device import (get_device_id, get_device_name,
-                               get_nccl_backend, get_torch_device)
-from verl.utils.fsdp_utils import (load_fsdp_model_to_gpu, load_fsdp_optimizer,
-                                   offload_fsdp2_model_to_cpu,
-                                   offload_fsdp_model_to_cpu,
-                                   offload_fsdp_optimizer)
-from verl.utils.profiler import (DistProfiler, DistProfilerExtension,
-                                 ProfilerConfig, log_gpu_memory_usage,
-                                 simple_timer)
-from verl.workers.sharding_manager.fsdp_ulysses import \
-    FSDPUlyssesShardingManager
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.utils.device import get_device_name, get_nccl_backend
+from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu, offload_fsdp_optimizer
+from verl.utils.profiler import DistProfilerExtension, log_gpu_memory_usage
+from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
-
-from typing import Tuple
-
-import torch.nn as nn
-from qwen_vl_utils import process_vision_info
-from torch.distributed._composable.fsdp import CPUOffloadPolicy
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointImpl, checkpoint_wrapper)
-from torch.distributed.fsdp import fully_shard
-from transformers import AutoProcessor
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -86,7 +67,7 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
     4. Checkpointing and loading of model and optimizer states
     """
 
-    def __init__(self, config: DictConfig, role='hybrid', **kwargs):
+    def __init__(self, config: DictConfig, role="hybrid", **kwargs):
         log_gpu_memory_usage("Before Diffusion Worker init", logger=logger, level=logging.INFO)
         Worker.__init__(self)
 
@@ -130,7 +111,7 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             )
         else:
             self._register_dispatch_collect_info("actor", dp_rank=rank, is_collect=True)
-     
+
         self._register_dispatch_collect_info("rollout", dp_rank=rank, is_collect=True)
 
         # 只有当序列并行大小大于1时才创建分片管理器
@@ -151,28 +132,25 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
         # Initialize optimizers and schedulers
         self.actor_optimizer = None
         self.actor_lr_scheduler = None
-      
+
         # Checkpoint management
         self.checkpoint_manager = None
         self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
         self._is_offload_optimizer = self.config.actor.fsdp_config.get("optimizer_offload", False)
-      
+
         # Setup FSDP
         self._build_model_optimizer()
         log_gpu_memory_usage("After Diffusion Worker init", logger=logger, level=logging.INFO)
 
     def apply_fsdp2_and_ac(
-        self,
-        model: nn.Module, 
-        no_split_module_classes: list[str], 
-        is_train: bool = False,
-        cpu_offload: bool = False
+        self, model: nn.Module, no_split_module_classes: list[str], is_train: bool = False, cpu_offload: bool = False
     ) -> nn.Module:
         """
         Applies FSDP2 fully_shard, CPU offloading, and Activation Checkpointing
         to sub-modules based on their class names.
         """
         from torch.distributed.fsdp import MixedPrecisionPolicy
+
         offload_policy = CPUOffloadPolicy()
 
         # param_dtype=bf16: forward/backward compute in bf16 (memory efficient).
@@ -180,11 +158,15 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
         # (fp32 thanks to dit_model.float() before wrapping), so the optimizer
         # operates on fp32 master weights.  reduce_dtype=fp32 ensures gradient
         # all-reduce preserves full precision.
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-        ) if is_train else None
-  
+        mp_policy = (
+            MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+            )
+            if is_train
+            else None
+        )
+
         # Iterate over modules to wrap specific layer blocks (e.g. Decoder layers, Vision blocks)
         for name, module in model.named_modules():
             if module.__class__.__name__ in no_split_module_classes:
@@ -194,17 +176,17 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
                 # Apply FSDP2 fully_shard with CPU offloading
                 shard_kwargs = {}
                 if cpu_offload:
-                    shard_kwargs['offload_policy'] = offload_policy
+                    shard_kwargs["offload_policy"] = offload_policy
                 if mp_policy is not None:
-                    shard_kwargs['mp_policy'] = mp_policy
+                    shard_kwargs["mp_policy"] = mp_policy
                 fully_shard(module, **shard_kwargs)
-          
+
         # Finally, wrap the root module
         shard_kwargs = {}
         if cpu_offload:
-            shard_kwargs['offload_policy'] = offload_policy
+            shard_kwargs["offload_policy"] = offload_policy
         if mp_policy is not None:
-            shard_kwargs['mp_policy'] = mp_policy
+            shard_kwargs["mp_policy"] = mp_policy
         fully_shard(model, **shard_kwargs)
         return model
 
@@ -220,8 +202,7 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             logger.info(f"Loading Mammothmoda2Model from {model_id_or_path}...")
 
         # Import from the local mammothmoda2 package
-        from recipe.dance_grpo.mammothmoda2.model import (DEFAULT_NEGATIVE_PROMPT,
-                                        Mammothmoda2Model)
+        from recipe.dance_grpo.mammothmoda2.model import Mammothmoda2Model
 
         # Load base model (weights kept on CPU initially to save memory before FSDP wrapping)
         full_model = Mammothmoda2Model.from_pretrained(
@@ -230,16 +211,16 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             t2i_generate=True,
         ).to(torch.bfloat16)
         processor = AutoProcessor.from_pretrained(
-            model_id_or_path, 
+            model_id_or_path,
             t2i_generate=True,
             ar_height=32,
             ar_width=32,
         )
 
         # 1. Extract the modules
-        mllm_model = full_model.llm_model       # Qwen3-VL based text encoder
+        mllm_model = full_model.llm_model  # Qwen3-VL based text encoder
         dit_model = full_model.gen_transformer  # Transformer2DModel (DiT)
-        vae_model = full_model.gen_vae          # AutoencoderKL
+        vae_model = full_model.gen_vae  # AutoencoderKL
 
         # 2. Configure train/eval modes & requires_grad
         # The training only happens on DiT, so all other components are set to eval and no_grad
@@ -250,20 +231,20 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
         vae_model.eval()
         for param in vae_model.parameters():
             param.requires_grad = False
-        vae_model.to('npu')
+        vae_model.to("npu")
 
         dit_model.train()
-        
+
         # Determine parameter freezing based on configuration
         freeze_non_attn_ffn = getattr(self.config.actor, "freeze_non_attn_ffn", False)
-        
+
         if freeze_non_attn_ffn:
             # Freeze all DiT parameters first, then selectively enable attention and FFN layers.
             for param in dit_model.parameters():
                 param.requires_grad = False
             _attn_ffn_re = re.compile(
-                r'\battn\b|\battention\b|self_attn|cross_attn|\.ff\.|'
-                r'\.ff1\.|ff\.net|\bmlp\b|\.ffn\.|feed_forward'
+                r"\battn\b|\battention\b|self_attn|cross_attn|\.ff\.|"
+                r"\.ff1\.|ff\.net|\bmlp\b|\.ffn\.|feed_forward"
             )
             for name, param in dit_model.named_parameters():
                 if _attn_ffn_re.search(name):
@@ -335,6 +316,7 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
 
         # Build LR scheduler using get_scheduler from diffusers.optimization
         from diffusers.optimization import get_scheduler
+
         self.actor_lr_scheduler = get_scheduler(
             self.config.actor.optim.lr_scheduler.name,
             optimizer=self.actor_optimizer,
@@ -349,7 +331,7 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
         actor_config = self.config.actor
         self.rollout = HFRollout(mllm, dit, vae, full_model, self.processor, config=rollout_config)
         self.actor = DataParallelPPOActor(self.dit, actor_config)
-        self.inferencer = HPSv3RewardInferencer(device='cpu', checkpoint_path=self.config.model.reward_model_path)
+        self.inferencer = HPSv3RewardInferencer(device="cpu", checkpoint_path=self.config.model.reward_model_path)
         self.inferencer.model.eval()
         for param in self.inferencer.model.parameters():
             param.requires_grad = False
@@ -374,8 +356,8 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
     def read_inputs_and_generate_latents(self, data: DataProto):
         """Read inputs from data and generate latents using mllm model"""
         # Get text and image/video inputs from data
-        messages = data.non_tensor_batch['messages']
-      
+        messages = data.non_tensor_batch["messages"]
+
         if messages is None:
             raise ValueError("Messages are required for generate_latents")
         load_fsdp_model_to_gpu(self.actor_module_fsdp.text_encoder)
@@ -383,65 +365,61 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
         with torch.no_grad():
             # Extract prompt from messages
             message = messages[0]
-            prompt = message[0]['content'][0]['text']
-            negative_prompt = "" # messages[0]['content'][0]['negative_prompt']
-          
+            prompt = message[0]["content"][0]["text"]
+            # messages[0]['content'][0]['negative_prompt']
+            negative_prompt = ""
+
             # Preprocess inputs
             text_embd_dict = self.actor_module_fsdp.preprocess(prompt, negative_prompt, None, None)
-          
+
             # Generate latents and text embeddings
             z, text_hidden_states, negative_text_hidden_states = self.actor_module_fsdp.mllm_generate(
                 text_embd_dict, None, None, None
             )
-          
+
             # Create dummy masks (mammothmoda25 doesn't use these in the same way)
             batch_size = z.shape[0]
             seq_len = text_hidden_states.shape[1]
             text_attention_mask = torch.ones(batch_size, seq_len).to(z.device)
             negative_text_attention_mask = torch.ones(batch_size, seq_len).to(z.device)
-          
+
             ref_latent = [None] * batch_size
-          
+
             output = DataProto.from_dict(
                 tensors={
-                    'z': z,
-                    'text_hidden_states': text_hidden_states,
-                    'text_attention_mask': text_attention_mask,
-                    'negative_text_hidden_states': negative_text_hidden_states,
-                    'negative_text_attention_mask': negative_text_attention_mask,
+                    "z": z,
+                    "text_hidden_states": text_hidden_states,
+                    "text_attention_mask": text_attention_mask,
+                    "negative_text_hidden_states": negative_text_hidden_states,
+                    "negative_text_attention_mask": negative_text_attention_mask,
                 },
-                non_tensors={
-                    'ref_latents': np.array(ref_latent, dtype=object)
-                },
+                non_tensors={"ref_latents": np.array(ref_latent, dtype=object)},
             )
-      
+
         # Update data with generated latents, embeddings
         data.batch = output.batch
         return data.union(output)
 
     def compute_rewards(self, data: DataProto):
         """Compute rewards for the generated sequences"""
-        batch_size = data.batch.batch_size[0]
-        scores_list = []
-
-        prompts = data.non_tensor_batch['prompts'].tolist()
-        all_images = data.non_tensor_batch['all_images']
+        prompts = data.non_tensor_batch["prompts"].tolist()
+        all_images = data.non_tensor_batch["all_images"]
         all_images_pil = [Image.fromarray(img_np) for img_np in all_images]
 
         def get_temp_paths(images):
             temp_paths = []
 
             for img in images:
-                fd, path = tempfile.mkstemp(suffix='.png')
-              
+                fd, path = tempfile.mkstemp(suffix=".png")
+
                 try:
-                    with os.fdopen(fd, 'wb') as tmp:
-                        img.save(tmp, format='PNG')
+                    with os.fdopen(fd, "wb") as tmp:
+                        img.save(tmp, format="PNG")
                     temp_paths.append(path)
                 except Exception as e:
                     os.close(fd)
                     logger.error(f"Error saving image: {e}")
-                  
+
             return temp_paths
 
         def cleanup_temp_files(paths):
@@ -455,13 +433,13 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
         # Execute
         file_paths = get_temp_paths(all_images_pil)
 
-        if self.inferencer.device == 'cpu':
-            self.inferencer.model.to('npu')
-            self.inferencer.device = 'npu'
+        if self.inferencer.device == "cpu":
+            self.inferencer.model.to("npu")
+            self.inferencer.device = "npu"
         with torch.no_grad():
             rewards = self.inferencer.reward(file_paths, prompts)
-        self.inferencer.model.to('cpu')
-        self.inferencer.device = 'cpu'
+        self.inferencer.model.to("cpu")
+        self.inferencer.device = "cpu"
 
         cleanup_temp_files(file_paths)
 
@@ -483,7 +461,7 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
 
         # data = self.read_inputs_and_generate_latents(data)
         data = data.repeat(repeat_times=self.config.rollout.n, interleave=True)
-      
+
         # Handle mammothmoda25 pipeline directly
         with torch.no_grad():
             # Get inputs from data
@@ -512,20 +490,20 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             step_dir = os.path.join(output_dir, experiment_name, f"step_{global_step:06d}")
             os.makedirs(step_dir, exist_ok=True)
 
-            prompts     = list(data.non_tensor_batch.get("prompts", []))
+            prompts = list(data.non_tensor_batch.get("prompts", []))
             image_paths = list(data.non_tensor_batch.get("image_paths", []))
-            rewards     = data.batch.get("rewards", None)
+            rewards = data.batch.get("rewards", None)
 
             lines = []
             n_samples = len(prompts)
             for i in range(n_samples):
                 entry = {
-                    "index":       i,
-                    "rank":        rank,
+                    "index": i,
+                    "rank": rank,
                     "global_step": global_step,
-                    "prompt":      str(prompts[i]) if i < len(prompts) else "",
-                    "reward":      float(rewards[i].item()) if rewards is not None and i < len(rewards) else None,
-                    "image_path":  str(image_paths[i]) if i < len(image_paths) else "",
+                    "prompt": str(prompts[i]) if i < len(prompts) else "",
+                    "reward": float(rewards[i].item()) if rewards is not None and i < len(rewards) else None,
+                    "image_path": str(image_paths[i]) if i < len(image_paths) else "",
                 }
                 lines.append(json.dumps(entry))
 
@@ -569,38 +547,45 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             # 1.  Unpack rollout data                                          #
             # -------------------------------------------------------------- #
             data = data.to(get_device_name())
-            all_latents    = data.batch["all_latents"].float()  # [B, T+1, C, H, W]  ensure float32
-            old_log_probs  = data.batch["all_log_probs"].float()  # [B, T]  ensure float32
-            rewards        = data.batch["rewards"].float()   # [B]  (already scaled at reward model output)
+            # [B, T+1, C, H, W]  ensure float32
+            all_latents = data.batch["all_latents"].float()
+            # [B, T]  ensure float32
+            old_log_probs = data.batch["all_log_probs"].float()
+            # [B]  (already scaled at reward model output)
+            rewards = data.batch["rewards"].float()
 
-            text_hidden_states  = data.batch["text_hidden_states"]   # [B, L_padded, D]
-            text_attention_mask = data.batch["text_attention_mask"]  # [B, L_padded]
+            # [B, L_padded, D]
+            text_hidden_states = data.batch["text_hidden_states"]
+            # [B, L_padded]
+            text_attention_mask = data.batch["text_attention_mask"]
 
             has_neg = "negative_text_hidden_states" in data.batch.keys()
-            neg_text_hidden_states  = data.batch.get("negative_text_hidden_states", None)
+            neg_text_hidden_states = data.batch.get("negative_text_hidden_states", None)
             neg_text_attention_mask = data.batch.get("negative_text_attention_mask", None)
 
             has_img_cond = "image_hidden_states" in data.batch.keys()
-            img_hidden_states  = data.batch.get("image_hidden_states", None)
+            img_hidden_states = data.batch.get("image_hidden_states", None)
             img_attention_mask = data.batch.get("image_attention_mask", None)
 
             # Actual (unpadded) sequence lengths stored by rollout for each conditioning tensor.
             # After DataProto.concat, different samples may have different original lengths.
             # Use the max across the batch so no sample's tokens get cut.
             text_actual_len = int(data.batch["text_seq_len"].max().item())
-            neg_actual_len  = int(data.batch["neg_seq_len"].max().item()) if "neg_seq_len" in data.batch.keys() else None
-            img_actual_len  = int(data.batch["image_seq_len"].max().item()) if "image_seq_len" in data.batch.keys() else None
+            neg_actual_len = int(data.batch["neg_seq_len"].max().item()) if "neg_seq_len" in data.batch.keys() else None
+            img_actual_len = (
+                int(data.batch["image_seq_len"].max().item()) if "image_seq_len" in data.batch.keys() else None
+            )
 
             # Truncate padded conditioning back to original length so training DiT
             # sees the same sequence length that the rollout DiT used.
             # _pad_or_truncate_conditioning left-pads, so we keep the RIGHTMOST tokens.
-            text_hidden_states  = text_hidden_states[:, -text_actual_len:, :]
+            text_hidden_states = text_hidden_states[:, -text_actual_len:, :]
             text_attention_mask = text_attention_mask[:, -text_actual_len:]
             if has_neg and neg_actual_len is not None:
-                neg_text_hidden_states  = neg_text_hidden_states[:, -neg_actual_len:, :]
+                neg_text_hidden_states = neg_text_hidden_states[:, -neg_actual_len:, :]
                 neg_text_attention_mask = neg_text_attention_mask[:, -neg_actual_len:]
             if has_img_cond and img_actual_len is not None:
-                img_hidden_states  = img_hidden_states[:, -img_actual_len:, :]
+                img_hidden_states = img_hidden_states[:, -img_actual_len:, :]
                 img_attention_mask = img_attention_mask[:, -img_actual_len:]
 
             device = all_latents.device
@@ -608,13 +593,14 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             # -------------------------------------------------------------- #
             # 2.  Configuration                                                #
             # -------------------------------------------------------------- #
-            actor_config   = self.config.actor
-            clip_range     = actor_config.ppo_clip_range
-            adv_clip_max   = actor_config.ppo_adv_clip_max
-            max_grad_norm  = actor_config.ppo_max_grad_norm
-            kl_coeff       = actor_config.ppo_kl_coeff
-            micro_bs       = actor_config.micro_batch_size   # microbatch size for gradient accumulation
-            grpo_size      = self.config.rollout.n           # samples per prompt group
+            actor_config = self.config.actor
+            clip_range = actor_config.ppo_clip_range
+            adv_clip_max = actor_config.ppo_adv_clip_max
+            max_grad_norm = actor_config.ppo_max_grad_norm
+            kl_coeff = actor_config.ppo_kl_coeff
+            # microbatch size for gradient accumulation
+            micro_bs = actor_config.micro_batch_size
+            grpo_size = self.config.rollout.n  # samples per prompt group
             # train_cfg_scale > 1.0 enables classifier-free guidance during the training
             # forward pass (mirrors rollout cfg_scale).  Requires negative embeddings in data.
             train_cfg_scale = float(actor_config.get("train_cfg_scale", 1.0))
@@ -630,7 +616,7 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
                 sigma_schedule = torch.linspace(0, 1, sampling_steps + 1, device=device)
                 sigma_schedule = omni_time_shift(actor_config.shift, sigma_schedule)
 
-            num_steps = sigma_schedule.shape[0] - 1   # T
+            num_steps = sigma_schedule.shape[0] - 1  # T
 
             # Randomly select a fraction of timestep indices for training.
             timestep_fraction = actor_config.timestep_fraction
@@ -656,9 +642,10 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             for group_idx in group_indices:
                 group_rewards = rewards[group_idx].float()
                 grp_mean = group_rewards.mean()
-                grp_std  = group_rewards.std().clamp_min(1e-8)
+                grp_std = group_rewards.std().clamp_min(1e-8)
                 advantages[group_idx] = (group_rewards - grp_mean) / grp_std
-                group_reward_stds.append(group_rewards.std().item())  # raw std, before clamping
+                # raw std, before clamping
+                group_reward_stds.append(group_rewards.std().item())
             avg_group_reward_std = sum(group_reward_stds) / len(group_reward_stds)
             min_group_reward_std = min(group_reward_stds)
             if torch.distributed.get_rank() == 0:
@@ -673,22 +660,23 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             self.dit.train()
             self.actor_optimizer.zero_grad()
 
-            total_loss        = 0.0
+            total_loss = 0.0
             total_policy_loss = 0.0
-            total_kl_loss     = 0.0
+            total_kl_loss = 0.0
 
             # ---- Debug metric accumulators ---- #
-            total_frac_clipped = 0.0      # fraction of ratios hitting clip boundary
-            total_new_lp       = 0.0      # mean of recomputed new log-probs
-            total_old_lp       = 0.0      # mean of old (rollout) log-probs
-            total_lp_diff      = 0.0      # mean of (new - old) log-prob
-            total_approx_kl    = 0.0      # approx KL = 0.5 * mean((ratio-1)^2)
-            total_ratio_mean   = 0.0      # accumulated ratio mean (avg across all timesteps)
-            total_ratio_max    = -float('inf')  # worst-case max ratio
-            total_ratio_min    = float('inf')    # worst-case min ratio
-            total_std_dev_t    = 0.0      # accumulate SDE noise scale per training timestep
-            total_diff_abs     = 0.0      # accumulate |x_next - predicted_mean| per microbatch
-            debug_count        = 0        # number of microbatches accumulated
+            total_frac_clipped = 0.0  # fraction of ratios hitting clip boundary
+            total_new_lp = 0.0  # mean of recomputed new log-probs
+            total_old_lp = 0.0  # mean of old (rollout) log-probs
+            total_lp_diff = 0.0  # mean of (new - old) log-prob
+            total_approx_kl = 0.0  # approx KL = 0.5 * mean((ratio-1)^2)
+            # accumulated ratio mean (avg across all timesteps)
+            total_ratio_mean = 0.0
+            total_ratio_max = -float("inf")  # worst-case max ratio
+            total_ratio_min = float("inf")  # worst-case min ratio
+            total_std_dev_t = 0.0  # accumulate SDE noise scale per training timestep
+            total_diff_abs = 0.0  # accumulate |x_next - predicted_mean| per microbatch
+            debug_count = 0  # number of microbatches accumulated
 
             # Gradient-accumulation denominator: number of backward() calls.
             # mean() already averages over micro_bs samples, so the denominator
@@ -699,17 +687,19 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             train_step_count = 0
             for timestep_idx in train_timestep_indices:
                 # Current and next noisy latents for this step.
-                current_latents = all_latents[:, timestep_idx]      # [B, C, H, W]
-                next_latents    = all_latents[:, timestep_idx + 1]  # [B, C, H, W]
+                current_latents = all_latents[:, timestep_idx]  # [B, C, H, W]
+                next_latents = all_latents[:, timestep_idx + 1]  # [B, C, H, W]
 
                 # Scalar timestep value (0–1) for DiT conditioning.
                 t_val = sigma_schedule[timestep_idx]  # scalar
                 # eta used during rollout, needed to recompute std_dev for SDE log-prob.
                 t_next_val = sigma_schedule[timestep_idx + 1]
-                dt   = (t_next_val - t_val).abs()
-                eta  = getattr(self.config.rollout, "eta", 0.3)
+                dt = (t_next_val - t_val).abs()
+                eta = getattr(self.config.rollout, "eta", 0.3)
                 # Match rollout formula exactly: sqrt(abs(dt) + 1e-12) not sqrt(clamp(dt, 1e-12))
-                std_dev_t = eta * torch.sqrt(torch.abs(torch.tensor(dt.item(), device=device, dtype=torch.float32)) + 1e-12)
+                std_dev_t = eta * torch.sqrt(
+                    torch.abs(torch.tensor(dt.item(), device=device, dtype=torch.float32)) + 1e-12
+                )
                 total_std_dev_t += std_dev_t.item()
 
                 timestep_tensor = t_val.to(torch.bfloat16).expand(batch_size)  # [B] bf16, matching rollout
@@ -722,18 +712,20 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
                     # Cast current latents to bf16 to match rollout precision:
                     # processing() casts prev_sample to bf16 between steps, so
                     # the rollout DiT and log-prob math use bf16-rounded values.
-                    mb_current   = current_latents[mb_idx].to(torch.bfloat16)   # [mb, C, H, W] bf16
-                    mb_next      = next_latents[mb_idx]                         # [mb, C, H, W] fp32
-                    mb_text      = text_hidden_states[mb_idx].to(device)        # [mb, L, D]
-                    mb_text_mask = text_attention_mask[mb_idx].to(device)       # [mb, L]
-                    mb_adv       = advantages[mb_idx]                           # [mb]
-                    mb_old_lp    = old_log_probs[mb_idx, timestep_idx]          # [mb]
-                    mb_ts        = timestep_tensor[mb_idx]                      # [mb]
+                    mb_current = current_latents[mb_idx].to(torch.bfloat16)  # [mb, C, H, W] bf16
+                    # [mb, C, H, W] fp32
+                    mb_next = next_latents[mb_idx]
+                    mb_text = text_hidden_states[mb_idx].to(device)  # [mb, L, D]
+                    mb_text_mask = text_attention_mask[mb_idx].to(device)  # [mb, L]
+                    # [mb]
+                    mb_adv = advantages[mb_idx]
+                    mb_old_lp = old_log_probs[mb_idx, timestep_idx]  # [mb]
+                    mb_ts = timestep_tensor[mb_idx]  # [mb]
 
-                    mb_neg_text      = neg_text_hidden_states[mb_idx].to(device)  if has_neg else None
+                    mb_neg_text = neg_text_hidden_states[mb_idx].to(device) if has_neg else None
                     mb_neg_text_mask = neg_text_attention_mask[mb_idx].to(device) if has_neg else None
-                    mb_img_cond      = img_hidden_states[mb_idx].to(device)       if has_img_cond else None
-                    mb_img_mask      = img_attention_mask[mb_idx].to(device)      if has_img_cond else None
+                    mb_img_cond = img_hidden_states[mb_idx].to(device) if has_img_cond else None
+                    mb_img_mask = img_attention_mask[mb_idx].to(device) if has_img_cond else None
 
                     # ---- Forward pass through DiT (with grad) ---- #
                     use_train_cfg = train_cfg_scale > 1.0 and has_neg and mb_neg_text is not None
@@ -782,29 +774,33 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
 
                     # ---- Recompute log-prob of rollout trajectory under current policy ---- #
                     # prev_sample_mean  = x_t + dt * v  (Euler step mean)
-                    prev_sample_mean = mb_current.to(torch.float32) + (t_next_val - t_val).item() * model_output.to(torch.float32)
+                    prev_sample_mean = mb_current.to(torch.float32) + (t_next_val - t_val).item() * model_output.to(
+                        torch.float32
+                    )
 
                     # SDE correction term (DanceGRPO SDE solver, matching rollout)
                     x_hat = mb_current.to(torch.float32) + (1.0 - t_val.item()) * model_output.to(torch.float32)
-                    score_estimate = -(mb_current.to(torch.float32) - t_val.item() * x_hat) / ((1.0 - t_val.item()) ** 2 + 1e-12)
-                    prev_sample_mean = prev_sample_mean + 0.5 * (eta ** 2) * score_estimate * (t_next_val - t_val).item()
+                    score_estimate = -(mb_current.to(torch.float32) - t_val.item() * x_hat) / (
+                        (1.0 - t_val.item()) ** 2 + 1e-12
+                    )
+                    prev_sample_mean = prev_sample_mean + 0.5 * (eta**2) * score_estimate * (t_next_val - t_val).item()
 
                     # Gaussian log-prob: log N(x_{t+1} | prev_sample_mean, std_dev_t^2 * I)
                     diff = mb_next.to(torch.float32) - prev_sample_mean
-                    var_t    = (std_dev_t ** 2).clamp_min(1e-20)
-                    log_std  = torch.log(std_dev_t.clamp_min(1e-20))
-                    log_2pi  = torch.log(torch.tensor(2.0 * math.pi, device=device, dtype=torch.float32))
-                    new_log_probs = (-(diff ** 2) / (2.0 * var_t) - log_std - 0.5 * log_2pi)
+                    var_t = (std_dev_t**2).clamp_min(1e-20)
+                    log_std = torch.log(std_dev_t.clamp_min(1e-20))
+                    log_2pi = torch.log(torch.tensor(2.0 * math.pi, device=device, dtype=torch.float32))
+                    new_log_probs = -(diff**2) / (2.0 * var_t) - log_std - 0.5 * log_2pi
                     new_log_probs = new_log_probs.mean(dim=tuple(range(1, new_log_probs.ndim)))  # [mb]
 
                     # ---- PPO-clip loss ---- #
                     clamped_adv = torch.clamp(mb_adv, -adv_clip_max, adv_clip_max)
-                    ratio       = torch.exp(new_log_probs - mb_old_lp.to(device))
-                    ratio_mean  = ratio.mean().item()
-                    ratio_max   = ratio.max().item()
-                    ratio_min   = ratio.min().item()
-                    unclipped   = -clamped_adv * ratio
-                    clipped     = -clamped_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                    ratio = torch.exp(new_log_probs - mb_old_lp.to(device))
+                    ratio_mean = ratio.mean().item()
+                    ratio_max = ratio.max().item()
+                    ratio_min = ratio.min().item()
+                    unclipped = -clamped_adv * ratio
+                    clipped = -clamped_adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
                     policy_loss = torch.mean(torch.maximum(unclipped, clipped)) / grad_accum_denom
 
                     loss = policy_loss
@@ -813,15 +809,15 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
                     with torch.no_grad():
                         _is_clipped = (ratio < 1.0 - clip_range) | (ratio > 1.0 + clip_range)
                         total_frac_clipped += _is_clipped.float().mean().item()
-                        total_new_lp       += new_log_probs.mean().item()
-                        total_old_lp       += mb_old_lp.mean().item()
-                        total_lp_diff      += (new_log_probs - mb_old_lp.to(device)).mean().item()
-                        total_approx_kl    += (0.5 * ((ratio - 1.0) ** 2)).mean().item()
-                        total_ratio_mean   += ratio_mean
-                        total_ratio_max    = max(total_ratio_max, ratio_max)
-                        total_ratio_min    = min(total_ratio_min, ratio_min)
-                        total_diff_abs     += diff.detach().abs().mean().item()
-                        debug_count        += 1
+                        total_new_lp += new_log_probs.mean().item()
+                        total_old_lp += mb_old_lp.mean().item()
+                        total_lp_diff += (new_log_probs - mb_old_lp.to(device)).mean().item()
+                        total_approx_kl += (0.5 * ((ratio - 1.0) ** 2)).mean().item()
+                        total_ratio_mean += ratio_mean
+                        total_ratio_max = max(total_ratio_max, ratio_max)
+                        total_ratio_min = min(total_ratio_min, ratio_min)
+                        total_diff_abs += diff.detach().abs().mean().item()
+                        debug_count += 1
 
                     # ---- Optional mean-prediction KL regulariser ---- #
                     # KL between N(mean_policy, sigma) and N(mean_ref, sigma) in closed form:
@@ -867,9 +863,13 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
                                     )
                             if isinstance(ref_out, (list, tuple)):
                                 ref_out = ref_out[0]
-                            ref_mean = mb_current.to(torch.float32) + (t_next_val - t_val).item() * ref_out.to(torch.float32)
+                            ref_mean = mb_current.to(torch.float32) + (t_next_val - t_val).item() * ref_out.to(
+                                torch.float32
+                            )
 
-                        kl_loss = ((prev_sample_mean - ref_mean.detach()) ** 2).mean() / (2.0 * var_t) / grad_accum_denom
+                        kl_loss = (
+                            ((prev_sample_mean - ref_mean.detach()) ** 2).mean() / (2.0 * var_t) / grad_accum_denom
+                        )
                         loss = policy_loss + kl_coeff * kl_loss
 
                         kl_reduced = kl_loss.detach().clone()
@@ -899,13 +899,18 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
                         f"ratio(mean/max/min)={ratio_mean}/{ratio_max}/{ratio_min}  "
                         f"time={end_time - start_time}s"
                     )
-                log_gpu_memory_usage(f"update_actor step {train_step_count}/{n_train_timesteps}", logger=logger, level=logging.DEBUG)
+                log_gpu_memory_usage(
+                    f"update_actor step {train_step_count}/{n_train_timesteps}",
+                    logger=logger,
+                    level=logging.DEBUG,
+                )
 
             # -------------------------------------------------------------- #
             # 7.  Gradient clip + optimiser step                              #
             # -------------------------------------------------------------- #
             grad_norm_raw = torch.nn.utils.clip_grad_norm_(self.dit.parameters(), max_grad_norm).item()
-            grad_clip_ratio = grad_norm_raw / max(max_grad_norm, 1e-8)  # > 1.0 means clipping was active
+            # > 1.0 means clipping was active
+            grad_clip_ratio = grad_norm_raw / max(max_grad_norm, 1e-8)
 
             # Snapshot the parameter with the LARGEST gradient norm BEFORE optimizer step.
             _debug_param_name = None
@@ -945,50 +950,51 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
 
             # Average accumulated debug metrics
             _dc = max(debug_count, 1)
-            avg_frac_clipped   = total_frac_clipped / _dc
-            avg_new_lp         = total_new_lp / _dc
-            avg_old_lp         = total_old_lp / _dc
-            avg_lp_diff        = total_lp_diff / _dc
-            avg_approx_kl      = total_approx_kl / _dc
-            avg_ratio_mean     = total_ratio_mean / _dc
-            avg_ratio_max      = total_ratio_max
-            avg_ratio_min      = total_ratio_min
-            avg_std_dev_t      = total_std_dev_t / max(n_train_timesteps, 1)
-            avg_diff_abs       = total_diff_abs / max(debug_count, 1)
-            advantage_mean     = advantages.mean().item()
-            advantage_std      = advantages.std().item()
-            reward_mean        = rewards.mean().item()
-            reward_std         = rewards.std().item()
-            reward_max         = rewards.max().item()
-            reward_min         = rewards.min().item()
+            avg_frac_clipped = total_frac_clipped / _dc
+            avg_new_lp = total_new_lp / _dc
+            avg_old_lp = total_old_lp / _dc
+            avg_lp_diff = total_lp_diff / _dc
+            avg_approx_kl = total_approx_kl / _dc
+            avg_ratio_mean = total_ratio_mean / _dc
+            avg_ratio_max = total_ratio_max
+            avg_ratio_min = total_ratio_min
+            avg_std_dev_t = total_std_dev_t / max(n_train_timesteps, 1)
+            avg_diff_abs = total_diff_abs / max(debug_count, 1)
+            advantage_mean = advantages.mean().item()
+            advantage_std = advantages.std().item()
+            reward_mean = rewards.mean().item()
+            reward_std = rewards.std().item()
+            reward_max = rewards.max().item()
+            reward_min = rewards.min().item()
 
             metrics = {
-                "train/total_loss":    total_loss,
-                "train/policy_loss":   total_policy_loss,
-                "train/kl_loss":       total_kl_loss,
-                "train/lr":            self.actor_lr_scheduler.get_last_lr()[0],
-                "train/ratio_mean":    avg_ratio_mean,   # avg across ALL timesteps (was last-step only)
-                "train/ratio_max":     avg_ratio_max,    # worst-case max across all timesteps
-                "train/ratio_min":     avg_ratio_min,    # worst-case min across all timesteps
+                "train/total_loss": total_loss,
+                "train/policy_loss": total_policy_loss,
+                "train/kl_loss": total_kl_loss,
+                "train/lr": self.actor_lr_scheduler.get_last_lr()[0],
+                # avg across ALL timesteps (was last-step only)
+                "train/ratio_mean": avg_ratio_mean,
+                "train/ratio_max": avg_ratio_max,  # worst-case max across all timesteps
+                "train/ratio_min": avg_ratio_min,  # worst-case min across all timesteps
                 # ---- Debug diagnostics ---- #
-                "debug/grad_norm_raw":      grad_norm_raw,
-                "debug/grad_clip_ratio":    grad_clip_ratio,
+                "debug/grad_norm_raw": grad_norm_raw,
+                "debug/grad_clip_ratio": grad_clip_ratio,
                 "debug/avg_group_reward_std": avg_group_reward_std,
                 "debug/min_group_reward_std": min_group_reward_std,
-                "debug/avg_std_dev_t":        avg_std_dev_t,
-                "debug/avg_diff_abs":         avg_diff_abs,
-                "debug/diff_over_noise":      avg_diff_abs / max(avg_std_dev_t, 1e-10),
-                "debug/frac_clipped":       avg_frac_clipped,
-                "debug/new_log_prob_mean":  avg_new_lp,
-                "debug/old_log_prob_mean":  avg_old_lp,
+                "debug/avg_std_dev_t": avg_std_dev_t,
+                "debug/avg_diff_abs": avg_diff_abs,
+                "debug/diff_over_noise": avg_diff_abs / max(avg_std_dev_t, 1e-10),
+                "debug/frac_clipped": avg_frac_clipped,
+                "debug/new_log_prob_mean": avg_new_lp,
+                "debug/old_log_prob_mean": avg_old_lp,
                 "debug/log_prob_diff_mean": avg_lp_diff,
-                "debug/approx_kl":          avg_approx_kl,
-                "debug/advantage_mean":     advantage_mean,
-                "debug/advantage_std":      advantage_std,
-                "debug/reward_mean":        reward_mean,
-                "debug/reward_std":         reward_std,
-                "debug/reward_max":         reward_max,
-                "debug/reward_min":         reward_min,
+                "debug/approx_kl": avg_approx_kl,
+                "debug/advantage_mean": advantage_mean,
+                "debug/advantage_std": advantage_std,
+                "debug/reward_mean": reward_mean,
+                "debug/reward_std": reward_std,
+                "debug/reward_max": reward_max,
+                "debug/reward_min": reward_min,
             }
 
             if torch.distributed.get_rank() == 0:
@@ -1019,22 +1025,22 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-      
+
         # For mammothmoda25, we need to save each component separately
         if torch.distributed.get_rank() == 0:
             checkpoint_path = os.path.join(local_path, "actor_model.pt")
-          
+
             # Save transformer and transformer_2 if they exist
             checkpoint = {}
-            checkpoint['transformer'] = self.actor_module_fsdp.transformer.state_dict()
-          
-            if hasattr(self.actor_module_fsdp, 'transformer_2') and self.actor_module_fsdp.transformer_2 is not None:
-                checkpoint['transformer_2'] = self.actor_module_fsdp.transformer_2.state_dict()
-          
+            checkpoint["transformer"] = self.actor_module_fsdp.transformer.state_dict()
+
+            if hasattr(self.actor_module_fsdp, "transformer_2") and self.actor_module_fsdp.transformer_2 is not None:
+                checkpoint["transformer_2"] = self.actor_module_fsdp.transformer_2.state_dict()
+
             # Save text encoder if it exists
-            if hasattr(self.actor_module_fsdp, 'text_encoder') and self.actor_module_fsdp.text_encoder is not None:
-                checkpoint['text_encoder'] = self.actor_module_fsdp.text_encoder.state_dict()
-          
+            if hasattr(self.actor_module_fsdp, "text_encoder") and self.actor_module_fsdp.text_encoder is not None:
+                checkpoint["text_encoder"] = self.actor_module_fsdp.text_encoder.state_dict()
+
             torch.save(checkpoint, checkpoint_path)
 
         dist.barrier()
@@ -1061,24 +1067,24 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-      
+
         # For mammothmoda25, load each component separately
         file_path = os.path.join(local_path, "actor_model.pt")
         checkpoint = torch.load(file_path)
-      
+
         # Load transformer
-        if 'transformer' in checkpoint:
-            self.actor_module_fsdp.transformer.load_state_dict(checkpoint['transformer'])
-      
+        if "transformer" in checkpoint:
+            self.actor_module_fsdp.transformer.load_state_dict(checkpoint["transformer"])
+
         # Load transformer_2 if it exists
-        if hasattr(self.actor_module_fsdp, 'transformer_2') and self.actor_module_fsdp.transformer_2 is not None:
-            if 'transformer_2' in checkpoint:
-                self.actor_module_fsdp.transformer_2.load_state_dict(checkpoint['transformer_2'])
-      
+        if hasattr(self.actor_module_fsdp, "transformer_2") and self.actor_module_fsdp.transformer_2 is not None:
+            if "transformer_2" in checkpoint:
+                self.actor_module_fsdp.transformer_2.load_state_dict(checkpoint["transformer_2"])
+
         # Load text encoder if it exists
-        if hasattr(self.actor_module_fsdp, 'text_encoder') and self.actor_module_fsdp.text_encoder is not None:
-            if 'text_encoder' in checkpoint:
-                self.actor_module_fsdp.text_encoder.load_state_dict(checkpoint['text_encoder'])
+        if hasattr(self.actor_module_fsdp, "text_encoder") and self.actor_module_fsdp.text_encoder is not None:
+            if "text_encoder" in checkpoint:
+                self.actor_module_fsdp.text_encoder.load_state_dict(checkpoint["text_encoder"])
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -1130,7 +1136,8 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
                     output = self.rollout._generate_minibatch(single_data)
 
                 # ---- Initial noise -------------------------------------- #
-                initial_noise = output.batch["all_latents"][0:1, 0].clone()  # [1, C, H, W]
+                # [1, C, H, W]
+                initial_noise = output.batch["all_latents"][0:1, 0].clone()
                 if torch.distributed.is_initialized():
                     dist.broadcast(initial_noise, src=0)
 
@@ -1154,16 +1161,18 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
                 # Sanitised short prompt tag for filenames (max 20 chars)
                 safe_prompt = re.sub(r"[^A-Za-z0-9._-]+", "_", prompt_str).strip("_")[:20] or "prompt"
 
-                self._fixed_eval_samples.append({
-                    "noise": initial_noise.cpu(),
-                    "conditioning": conditioning,
-                    "prompt": prompt_str,
-                    "safe_prompt": safe_prompt,
-                })
+                self._fixed_eval_samples.append(
+                    {
+                        "noise": initial_noise.cpu(),
+                        "conditioning": conditioning,
+                        "prompt": prompt_str,
+                        "safe_prompt": safe_prompt,
+                    }
+                )
 
                 if rank == 0:
                     logger.info(
-                        f"Fixed eval [{p_idx+1}/{num_eval_prompts}] prompt: '{prompt_str[:80]}' | "
+                        f"Fixed eval [{p_idx + 1}/{num_eval_prompts}] prompt: '{prompt_str[:80]}' | "
                         f"noise shape: {list(initial_noise.shape)}"
                     )
 
@@ -1206,8 +1215,8 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
 
         rollout_cfg = self.config.rollout
         num_inference_steps = int(getattr(rollout_cfg, "num_inference_steps", 40))
-        h              = int(getattr(rollout_cfg, "height", 512))
-        w              = int(getattr(rollout_cfg, "width", 512))
+        h = int(getattr(rollout_cfg, "height", 512))
+        w = int(getattr(rollout_cfg, "width", 512))
         vae_scale_factor = int(getattr(rollout_cfg, "vae_scale_factor", 16))
 
         eval_cfg_scales = [1.0, 3.0]
@@ -1225,17 +1234,17 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
             )
 
             # Warped timestep schedule — must match GRPOMockScheduler exactly.
-            latent_h   = 2 * h // vae_scale_factor
-            latent_w   = 2 * w // vae_scale_factor
+            latent_h = 2 * h // vae_scale_factor
+            latent_w = 2 * w // vae_scale_factor
             num_tokens = latent_h * latent_w
-            timesteps  = torch.linspace(0, 1, num_inference_steps + 1)
-            m          = (num_tokens ** 0.5) / 40.0
-            timesteps  = timesteps / (m + timesteps * (1.0 - m))
-            timesteps  = timesteps.to(dev)
+            timesteps = torch.linspace(0, 1, num_inference_steps + 1)
+            m = (num_tokens**0.5) / 40.0
+            timesteps = timesteps / (m + timesteps * (1.0 - m))
+            timesteps = timesteps.to(dev)
 
             vae = self.full_model.gen_vae
             scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
-            shift_factor   = getattr(vae.config, "shift_factor", 0.0)
+            shift_factor = getattr(vae.config, "shift_factor", 0.0)
 
             eval_dir = os.path.join(output_dir, experiment_name, "fixed_eval")
             if rank == 0:
@@ -1288,10 +1297,10 @@ class DiffusionActorRolloutWorker(Worker, DistProfilerExtension):
 
                     with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
                         for i in range(num_inference_steps):
-                            t      = timesteps[i]
+                            t = timesteps[i]
                             t_next = timesteps[i + 1]
-                            dt     = (t_next - t).item()
-                            ts     = t.unsqueeze(0).expand(1)
+                            dt = (t_next - t).item()
+                            ts = t.unsqueeze(0).expand(1)
 
                             if use_cfg:
                                 cond_out = self.dit(
@@ -1369,4 +1378,3 @@ def omni_time_shift(shift, t):
     t = (shift * t) / (1 + (shift - 1) * t)
     t = 1 - t
     return t
-

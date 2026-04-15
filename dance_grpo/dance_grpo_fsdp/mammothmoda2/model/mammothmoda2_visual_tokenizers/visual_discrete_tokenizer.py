@@ -1,13 +1,9 @@
-import math
-import traceback
-
 import numpy as np
 import torch
 from addict import Dict as ADict
 from loguru import logger
 from PIL import Image
 from torch import nn
-from torchvision import transforms
 
 from .mammothtok import VQVitModel2DPlus_AIMv2, VQVitModel2DPlusArgs
 

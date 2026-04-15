@@ -19,28 +19,15 @@ Single Process Actor
 
 import logging
 import os
-import math
 
 import torch
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.tensor import DTensor
 
-import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
-from verl.utils.device import get_device_id, get_device_name
-from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
-from verl.utils.profiler import GPUMemoryLogger
-from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.device import get_device_name
 from verl.utils.torch_dtypes import PrecisionType
-from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -78,7 +65,7 @@ class DataParallelPPOActor(BasePPOActor):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         GRPO one step implementation for diffusion model training
-        
+
         Args:
             data: DataProto containing batch data
             latents: Current latents
@@ -91,7 +78,7 @@ class DataParallelPPOActor(BasePPOActor):
             ref_latents: Reference latents for guidance
             negative_text_hidden_states: Negative prompts for CFG
             negative_text_attention_mask: Attention mask for negative prompts
-            
+
         Returns:
             log_prob: Log probability for PPO bookkeeping
             prev_sample_mean: Mean of the previous sample
@@ -101,9 +88,9 @@ class DataParallelPPOActor(BasePPOActor):
         is_test = os.getenv("IS_TEST", "TRUE").upper() in ["TRUE", "1"]
         if is_test:
             text_hidden_states = torch.randn(
-            (text_hidden_states.shape[0], text_hidden_states.shape[1], 3584),
-            device=text_hidden_states.device,
-            dtype=torch.bfloat16,
+                (text_hidden_states.shape[0], text_hidden_states.shape[1], 3584),
+                device=text_hidden_states.device,
+                dtype=torch.bfloat16,
             )
             negative_text_hidden_states = torch.randn(
                 (negative_text_hidden_states.shape[0], negative_text_hidden_states.shape[1], 3584),
@@ -119,7 +106,7 @@ class DataParallelPPOActor(BasePPOActor):
                 ref_latents,
                 negative_text_hidden_states,
                 negative_text_attention_mask,
-                i
+                i,
             )
         return log_probs, prev_sample_mean, std_dev_t
 

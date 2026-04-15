@@ -6,20 +6,19 @@ import os
 import sys
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import BytesIO
-from typing import Optional, Union, Tuple, List, Any, Dict
-from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Optional
 
+import numpy as np
 import requests
 import torch
 import torchvision
 from packaging import version
 from PIL import Image
-import numpy as np
 from torchvision import io, transforms
 from torchvision.transforms import InterpolationMode
-
 
 MAX_RATIO = 200
 SPATIAL_MERGE_SIZE = 2
@@ -34,7 +33,7 @@ FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
 MAX_NUM_WORKERS_FETCH_VIDEO = 8
 
-MODEL_SEQ_LEN = int(float(os.environ.get('MODEL_SEQ_LEN', 128000)))
+MODEL_SEQ_LEN = int(float(os.environ.get("MODEL_SEQ_LEN", 128000)))
 logger = logging.getLogger(__name__)
 
 
@@ -53,7 +52,13 @@ def floor_by_factor(number: int, factor: int) -> int:
     return math.floor(number / factor) * factor
 
 
-def smart_resize(height: int, width: int, factor: int, min_pixels: Optional[int] = None, max_pixels: Optional[int] = None) -> Tuple[int, int]:
+def smart_resize(
+    height: int,
+    width: int,
+    factor: int,
+    min_pixels: Optional[int] = None,
+    max_pixels: Optional[int] = None,
+) -> tuple[int, int]:
     """
     Rescales the image so that the following conditions are met:
 
@@ -61,8 +66,8 @@ def smart_resize(height: int, width: int, factor: int, min_pixels: Optional[int]
     2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
     3. The aspect ratio of the image is maintained as closely as possible.
     """
-    max_pixels = max_pixels if max_pixels is not None else (IMAGE_MAX_TOKEN_NUM * factor ** 2)
-    min_pixels = min_pixels if min_pixels is not None else (IMAGE_MIN_TOKEN_NUM * factor ** 2)
+    max_pixels = max_pixels if max_pixels is not None else (IMAGE_MAX_TOKEN_NUM * factor**2)
+    min_pixels = min_pixels if min_pixels is not None else (IMAGE_MIN_TOKEN_NUM * factor**2)
     assert max_pixels >= min_pixels, "The max_pixels of image must be greater than or equal to min_pixels."
     if max(height, width) / min(height, width) > MAX_RATIO:
         raise ValueError(
@@ -82,15 +87,15 @@ def smart_resize(height: int, width: int, factor: int, min_pixels: Optional[int]
 
 
 def to_rgb(pil_image: Image.Image) -> Image.Image:
-      if pil_image.mode == 'RGBA':
-          white_background = Image.new("RGB", pil_image.size, (255, 255, 255))
-          white_background.paste(pil_image, mask=pil_image.split()[3])  # Use alpha channel as mask
-          return white_background
-      else:
-          return pil_image.convert("RGB")
+    if pil_image.mode == "RGBA":
+        white_background = Image.new("RGB", pil_image.size, (255, 255, 255))
+        white_background.paste(pil_image, mask=pil_image.split()[3])  # Use alpha channel as mask
+        return white_background
+    else:
+        return pil_image.convert("RGB")
 
 
-def fetch_image(ele: Dict[str, Union[str, Image.Image]], image_patch_size: int = 14) -> Image.Image:
+def fetch_image(ele: dict[str, str | Image.Image], image_patch_size: int = 14) -> Image.Image:
     if "image" in ele:
         image = ele["image"]
     elif "image_url" in ele:
@@ -121,7 +126,7 @@ def fetch_image(ele: Dict[str, Union[str, Image.Image]], image_patch_size: int =
         raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
     image = to_rgb(image_obj)
 
-    ## resize
+    # resize
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = smart_resize(
             ele["resized_height"],
@@ -130,8 +135,8 @@ def fetch_image(ele: Dict[str, Union[str, Image.Image]], image_patch_size: int =
         )
     else:
         width, height = image.size
-        min_pixels = ele.get("min_pixels", IMAGE_MIN_TOKEN_NUM * patch_factor ** 2)
-        max_pixels = ele.get("max_pixels", IMAGE_MAX_TOKEN_NUM * patch_factor ** 2)
+        min_pixels = ele.get("min_pixels", IMAGE_MIN_TOKEN_NUM * patch_factor**2)
+        max_pixels = ele.get("max_pixels", IMAGE_MAX_TOKEN_NUM * patch_factor**2)
         resized_height, resized_width = smart_resize(
             height,
             width,
@@ -144,9 +149,9 @@ def fetch_image(ele: Dict[str, Union[str, Image.Image]], image_patch_size: int =
 
 
 def smart_nframes(
-    ele: Dict[str, Any],
+    ele: dict[str, Any],
     total_frames: int,
-    video_fps: Union[int, float],
+    video_fps: int | float,
 ) -> int:
     """calculate the number of frames for video used for model inputs.
 
@@ -184,8 +189,8 @@ def smart_nframes(
 
 
 def _read_video_torchvision(
-    ele: Dict[str, Any],
-) -> Tuple[torch.Tensor, float]:
+    ele: dict[str, Any],
+) -> tuple[torch.Tensor, float]:
     """read video using torchvision.io.read_video
 
     Args:
@@ -200,7 +205,10 @@ def _read_video_torchvision(
     video_path = ele["video"]
     if version.parse(torchvision.__version__) < version.parse("0.19.0"):
         if "http://" in video_path or "https://" in video_path:
-            warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
+            warnings.warn(
+                "torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.",
+                stacklevel=2,
+            )
         if "file://" in video_path:
             video_path = video_path[7:]
     st = time.time()
@@ -234,10 +242,10 @@ def is_decord_available() -> bool:
 
 
 def calculate_video_frame_range(
-    ele: Dict[str, Any],
+    ele: dict[str, Any],
     total_frames: int,
     video_fps: float,
-) -> Tuple[int, int, int]:
+) -> tuple[int, int, int]:
     """
     Calculate the start and end frame indices based on the given time range.
 
@@ -282,18 +290,23 @@ def calculate_video_frame_range(
     # Validate frame order
     if start_frame >= end_frame:
         raise ValueError(
-            f"Invalid time range: Start frame {start_frame} (at {video_start_clamped if video_start is not None else 0}s) "
-            f"exceeds end frame {end_frame} (at {video_end_clamped if video_end is not None else max_duration}s). "
+            f"Invalid time range: Start frame {start_frame} "
+            f"(at {video_start_clamped if video_start is not None else 0}s) "
+            f"exceeds end frame {end_frame} "
+            f"(at {video_end_clamped if video_end is not None else max_duration}s). "
             f"Video duration: {max_duration:.2f}s ({total_frames} frames @ {video_fps}fps)"
         )
 
-    logger.info(f"calculate video frame range: {start_frame=}, {end_frame=}, {total_frames=} from {video_start=}, {video_end=}, {video_fps=:.3f}")
+    logger.info(
+        f"calculate video frame range: {start_frame=}, {end_frame=}, {total_frames=} "
+        f"from {video_start=}, {video_end=}, {video_fps=:.3f}"
+    )
     return start_frame, end_frame, end_frame - start_frame + 1
 
 
 def _read_video_decord(
-    ele: Dict[str, Any],
-) -> Tuple[torch.Tensor, float]:
+    ele: dict[str, Any],
+) -> tuple[torch.Tensor, float]:
     """read video using decord.VideoReader
 
     Args:
@@ -306,6 +319,7 @@ def _read_video_decord(
         torch.Tensor: the video tensor with shape (T, C, H, W).
     """
     import decord
+
     video_path = ele["video"]
     st = time.time()
     vr = decord.VideoReader(video_path)
@@ -338,8 +352,8 @@ def is_torchcodec_available() -> bool:
 
 
 def _read_video_torchcodec(
-    ele: Dict[str, Any],
-) -> Tuple[torch.Tensor, float]:
+    ele: dict[str, Any],
+) -> tuple[torch.Tensor, float]:
     """read video using torchcodec.decoders.VideoDecoder
 
     Args:
@@ -352,7 +366,8 @@ def _read_video_torchcodec(
         torch.Tensor: the video tensor with shape (T, C, H, W).
     """
     from torchcodec.decoders import VideoDecoder
-    TORCHCODEC_NUM_THREADS = int(os.environ.get('TORCHCODEC_NUM_THREADS', 8))
+
+    TORCHCODEC_NUM_THREADS = int(os.environ.get("TORCHCODEC_NUM_THREADS", 8))
     logger.info(f"set TORCHCODEC_NUM_THREADS: {TORCHCODEC_NUM_THREADS}")
     video_path = ele["video"]
     st = time.time()
@@ -402,8 +417,12 @@ def get_video_reader_backend() -> str:
     return video_reader_backend
 
 
-def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sample_fps: bool = False,
-                return_video_metadata: bool = False) -> Union[torch.Tensor, List[Image.Image]]:
+def fetch_video(
+    ele: dict[str, Any],
+    image_patch_size: int = 14,
+    return_video_sample_fps: bool = False,
+    return_video_metadata: bool = False,
+) -> torch.Tensor | list[Image.Image]:
     image_factor = image_patch_size * SPATIAL_MERGE_SIZE
     VIDEO_FRAME_MIN_PIXELS = VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
     VIDEO_FRAME_MAX_PIXELS = VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
@@ -434,10 +453,7 @@ def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sa
             image_list.extend([image_list[-1]] * (nframes - len(image_list)))
 
         sample_fps = ele.get("sample_fps", 2.0)
-        video = torch.stack([
-            torch.from_numpy(np.array(image).transpose(2, 0, 1))
-            for image in image_list
-        ])
+        video = torch.stack([torch.from_numpy(np.array(image).transpose(2, 0, 1)) for image in image_list])
 
         # fake video metadata
         raw_fps = process_info.pop("raw_fps", sample_fps)
@@ -482,7 +498,7 @@ def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sa
     return final_video
 
 
-def extract_vision_info(conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+def extract_vision_info(conversations: list[dict[str, Any]] | list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
     vision_infos = []
     if isinstance(conversations[0], dict):
         conversations = [conversations]
@@ -501,7 +517,10 @@ def extract_vision_info(conversations: Union[List[Dict[str, Any]], List[List[Dic
     return vision_infos
 
 
-def extract_ref_image(conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]], max_pixels: int = 1024 * 1024) -> List[Image.Image]:
+def extract_ref_image(
+    conversations: list[dict[str, Any]] | list[list[dict[str, Any]]],
+    max_pixels: int = 1024 * 1024,
+) -> list[Image.Image]:
     ref_images = []
     if isinstance(conversations[0], dict):
         conversations = [conversations]
@@ -523,15 +542,18 @@ def extract_ref_image(conversations: Union[List[Dict[str, Any]], List[List[Dict[
 
 
 def process_vision_info(
-    conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
+    conversations: list[dict[str, Any]] | list[list[dict[str, Any]]],
     return_video_kwargs: bool = False,
     return_video_metadata: bool = False,
     image_patch_size: int = 14,
     gen_image_patch_size: int = 7,
-) -> Tuple[Optional[List[Image.Image]], Optional[List[Union[torch.Tensor, List[Image.Image]]]], Optional[Dict[str, Any]]]:
-
+) -> tuple[
+    Optional[list[Image.Image]],
+    Optional[list[torch.Tensor | list[Image.Image]]],
+    Optional[dict[str, Any]],
+]:
     vision_infos = extract_vision_info(conversations)
-    ## Read images or videos
+    # Read images or videos
     image_inputs = []
     gen_image_inputs = []
     video_inputs = []
@@ -542,8 +564,12 @@ def process_vision_info(
         elif "image_gen" in vision_info:
             gen_image_inputs.append(fetch_image(vision_info, image_patch_size=gen_image_patch_size))
         elif "video" in vision_info:
-            video_input, video_sample_fps = fetch_video(vision_info, return_video_sample_fps=True,
-                        image_patch_size=image_patch_size, return_video_metadata=return_video_metadata)
+            video_input, video_sample_fps = fetch_video(
+                vision_info,
+                return_video_sample_fps=True,
+                image_patch_size=image_patch_size,
+                return_video_metadata=return_video_metadata,
+            )
             video_sample_fps_list.append(video_sample_fps)
             video_inputs.append(video_input)
         else:
@@ -555,9 +581,9 @@ def process_vision_info(
     if len(video_inputs) == 0:
         video_inputs = None
 
-    video_kwargs = {'do_sample_frames': False}
-    if not return_video_metadata: # BC for qwen2.5vl
-        video_kwargs.update({'fps': video_sample_fps_list})
+    video_kwargs = {"do_sample_frames": False}
+    if not return_video_metadata:  # BC for qwen2.5vl
+        video_kwargs.update({"fps": video_sample_fps_list})
 
     if return_video_kwargs:
         return image_inputs, gen_image_inputs, video_inputs, video_kwargs

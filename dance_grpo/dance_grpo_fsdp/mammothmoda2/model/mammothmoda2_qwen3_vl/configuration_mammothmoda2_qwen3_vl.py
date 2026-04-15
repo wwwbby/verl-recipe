@@ -44,7 +44,7 @@ class Mammothmoda2Qwen3VLVisionConfig(PretrainedConfig):
         temporal_patch_size=2,
         out_hidden_size=3584,
         num_position_embeddings=2304,
-        deepstack_visual_indexes=[8, 16, 24],
+        deepstack_visual_indexes=None,
         initializer_range=0.02,
         **kwargs,
     ):
@@ -62,7 +62,9 @@ class Mammothmoda2Qwen3VLVisionConfig(PretrainedConfig):
         self.out_hidden_size = out_hidden_size
         self.num_position_embeddings = num_position_embeddings
         self.initializer_range = initializer_range
-        self.deepstack_visual_indexes = deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            deepstack_visual_indexes if deepstack_visual_indexes is not None else [8, 16, 24]
+        )
 
 
 class Mammothmoda2Qwen3VLTextConfig(PretrainedConfig):

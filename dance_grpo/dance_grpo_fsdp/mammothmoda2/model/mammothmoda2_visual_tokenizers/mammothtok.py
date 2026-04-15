@@ -3,7 +3,7 @@ MammothTok Model
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 # from skimage.metrics import peak_signal_noise_ratio as psnr_loss
 # from skimage.metrics import structural_similarity as ssim_loss
@@ -38,7 +38,7 @@ def depth_to_space(x: torch.Tensor, block_size: int) -> torch.Tensor:
     """
     # check inputs
     if x.dim() < 3:
-        raise ValueError(f"Expecting a channels-first (*CHW) tensor of at least 3 dimensions")
+        raise ValueError("Expecting a channels-first (*CHW) tensor of at least 3 dimensions")
     c, h, w = x.shape[-3:]
 
     s = block_size**2
@@ -303,7 +303,6 @@ class AttentionCustom(nn.Module):
         self.dim = dim
         self.head_dim = dim // n_head
         self.n_head = n_head
-        total_qkv_dim = 3 * self.n_head * self.head_dim
 
         # key, query, value projections for all heads, but in a batch
         self.q_proj = nn.Linear(dim, dim, bias=not no_bias)
@@ -1055,7 +1054,6 @@ class ViTDecoder2D(nn.Module):
 
     def forward(self, z_quantized, ret_inner_feat=False):
         N, C, H, W = z_quantized.shape
-        selected_latent_tokens = W
         x = z_quantized.reshape(N, C, H * W).permute(2, 0, 1)  # LND
         x = self.decoder_embed(self.ln_pre(x))
 
@@ -1234,7 +1232,7 @@ class Decoder(nn.Module):
                     h = self.adaptive[i_level](h, style)
                 except Exception as e:
                     error_info = str(e) + f"Showing the h shape: {h.shape}, {style.shape}"
-                    raise ValueError(error_info)
+                    raise ValueError(error_info) from e
             for i_block in range(self.num_res_blocks + 1):
                 h = block.res[i_block](h)
                 if self.use_attn and len(block.attn) > 0:
@@ -1685,8 +1683,8 @@ class VQVitModelPlusArgs:
     codebook_transform: str = None
     freeze_codebook: bool = False
 
-    encoder_ch_mult: List[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
-    decoder_ch_mult: List[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
+    encoder_ch_mult: list[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
+    decoder_ch_mult: list[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
     model_size: str = "small"
     encoder_size: str = None
     decoder_size: str = None
@@ -1768,8 +1766,8 @@ class VQVitModel2DPlusArgs:
     commit_loss_beta: float = 0.25
     entropy_loss_ratio: float = 0.0
 
-    encoder_ch_mult: List[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
-    decoder_ch_mult: List[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
+    encoder_ch_mult: list[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
+    decoder_ch_mult: list[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
     model_size: str = "small"
     num_latent_tokens: int = 256
     encoder_size: str = None
@@ -1883,7 +1881,9 @@ class VQVitModel2DPlus_AIMv2(nn.Module):
 
     def load_pretrain_encoder(
         self,
-        pretrain_encoder_path="/mnt/bn/seutao-hl/chentaicai/MammothModa-U/tokenversa/GigaTok/checkpoints/model.safetensors",
+        pretrain_encoder_path=(
+            "/mnt/bn/seutao-hl/chentaicai/MammothModa-U/tokenversa/GigaTok/checkpoints/model.safetensors"
+        ),
     ):
         if pretrain_encoder_path is None:
             return

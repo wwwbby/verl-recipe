@@ -17,7 +17,6 @@
 import copy
 import logging
 import os
-import re
 import traceback
 from collections import defaultdict
 from typing import Optional
@@ -28,9 +27,6 @@ import torch
 from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
-
-import verl.utils.torch_functional as verl_F
-from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +56,7 @@ def collate_fn(data_list: list[dict]) -> dict:
     for key, val in tensors.items():
         try:
             tensors[key] = torch.stack(val, dim=0)
-        except:
+        except Exception:
             tensors[key] = val
 
     for key, val in non_tensors.items():
@@ -93,9 +89,8 @@ class RLHFDataset(Dataset):
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
         max_samples: int = -1,
-        use_negative = False
+        use_negative=False,
     ):
-
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
         self.data_files = copy.deepcopy(data_files)
@@ -184,7 +179,7 @@ class RLHFDataset(Dataset):
             prompt_key = self.prompt_key
 
             def doc2len(doc) -> int:
-                doc['prompt'] = doc['extra_info']['question']
+                doc["prompt"] = doc["extra_info"]["question"]
                 try:
                     apply_kwargs = dict(**self.apply_chat_template_kwargs)
                     if self.tool_schemas is not None:
@@ -210,7 +205,8 @@ class RLHFDataset(Dataset):
         self.serialize_dataset = not hasattr(self, "original_data_files")
         # resume dataframe if not it's serialized in data.pt
         if not self.serialize_dataset:
-            self._download(use_origin_parquet=True)  # download and resume from original parquet files
+            # download and resume from original parquet files
+            self._download(use_origin_parquet=True)
             self._read_files_and_tokenize()
         else:
             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
@@ -229,7 +225,6 @@ class RLHFDataset(Dataset):
         extra_info = row_dict.get("extra_info", {})
         row_dict["prompt"] = extra_info["question"]
         row_dict.update(extra_info)
-
 
         return row_dict
 

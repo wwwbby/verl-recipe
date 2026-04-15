@@ -18,21 +18,15 @@ import copy
 import logging
 import os
 import re
-import traceback
 from collections import defaultdict
 from typing import Optional
 
 import datasets
 import numpy as np
 import torch
-import torch.nn.functional as F
-from typing import Tuple, Literal
 from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
-
-import verl.utils.torch_functional as verl_F
-from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +56,7 @@ def collate_fn(data_list: list[dict]) -> dict:
     for key, val in tensors.items():
         try:
             tensors[key] = torch.stack(val, dim=0)
-        except:
+        except Exception:
             non_tensors[key] = np.fromiter(val, dtype=object, count=len(val))
 
     for key, val in non_tensors.items():
@@ -95,9 +89,8 @@ class RLHFDataset(Dataset):
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
         max_samples: int = -1,
-        use_negative = False
+        use_negative=False,
     ):
-
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
         self.data_files = copy.deepcopy(data_files)
@@ -185,8 +178,6 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             processor = self.processor
             prompt_key = self.prompt_key
-            image_key = self.image_key
-            video_key = self.video_key
 
             dataframe = dataframe.filter(
                 lambda doc: self.doc2len(prompt_key, doc, tokenizer, processor) <= self.max_prompt_length,
@@ -197,26 +188,24 @@ class RLHFDataset(Dataset):
             print(f"filter dataset len: {len(dataframe)}")
         return dataframe
 
-
     def doc2len(self, prompt_key, doc, tokenizer, processor) -> int:
         prompt = doc[prompt_key]
         if processor is not None:
             messages = self._build_messages(doc)
             content = messages[0].get("content", [])
-            if len(content) > 1 and content[0].get("type","")=="text":
+            if len(content) > 1 and content[0].get("type", "") == "text":
                 inputs, _ = processor.preprocess(messages)
                 input_ids = inputs["input_ids"]
-                input_ids_len =input_ids.size()[1]
+                input_ids_len = input_ids.size()[1]
             else:
                 apply_kwargs = dict(**self.apply_chat_template_kwargs)
                 if self.tool_schemas is not None:
                     apply_kwargs["tools"] = self.tool_schemas
                 input_ids_len = len(
-                    tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True,
-                                                    **apply_kwargs)
+                    tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, **apply_kwargs)
                 )
             return input_ids_len
-        elif  tokenizer.__class__.__name__ == "T5TokenizerFast":
+        elif tokenizer.__class__.__name__ == "T5TokenizerFast":
             text = prompt[0].get("content", "")
             text_inputs = tokenizer(
                 text,
@@ -240,7 +229,6 @@ class RLHFDataset(Dataset):
             )
             return input_ids_len
 
-
     def get_seq_len(self, doc, tokenizer, processor) -> int:
         if processor is not None:
             messages = self._build_messages(doc)
@@ -255,8 +243,7 @@ class RLHFDataset(Dataset):
                     apply_kwargs["tools"] = self.tool_schemas
 
                 input_ids_len = len(
-                    tokenizer.apply_chat_template(doc[self.prompt_key], add_generation_prompt=True,
-                                                  **apply_kwargs)
+                    tokenizer.apply_chat_template(doc[self.prompt_key], add_generation_prompt=True, **apply_kwargs)
                 )
             return input_ids_len
 
@@ -286,12 +273,12 @@ class RLHFDataset(Dataset):
 
             return input_ids_len
 
-
     def resume_dataset_state(self):
         self.serialize_dataset = not hasattr(self, "original_data_files")
         # resume dataframe if not it's serialized in data.pt
         if not self.serialize_dataset:
-            self._download(use_origin_parquet=True)  # download and resume from original parquet files
+            # download and resume from original parquet files
+            self._download(use_origin_parquet=True)
             self._read_files_and_tokenize()
         else:
             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
@@ -310,11 +297,11 @@ class RLHFDataset(Dataset):
                 segments = [item for item in segments if item != ""]
                 for segment in segments:
                     if segment == "<image>":
-                        images_path = example.get(self.image_key,'')
-                        content_list.append({"type": "image", "image": images_path,"max_pixels": 1024 * 1024})
-                        content_list.append({"type": "image_gen", "image": images_path,"max_pixels": 1024 * 1024})
+                        images_path = example.get(self.image_key, "")
+                        content_list.append({"type": "image", "image": images_path, "max_pixels": 1024 * 1024})
+                        content_list.append({"type": "image_gen", "image": images_path, "max_pixels": 1024 * 1024})
                     elif segment == "<video>":
-                        videos_path = example.get(self.video_key,'')
+                        videos_path = example.get(self.video_key, "")
                         content_list.append({"type": "video", "video": videos_path})
                     else:
                         content_list.append({"type": "text", "text": segment})
@@ -328,7 +315,6 @@ class RLHFDataset(Dataset):
                 message["content"] = content_list
 
         return messages
-
 
     def __getitem__(self, item):
         """
@@ -344,16 +330,14 @@ class RLHFDataset(Dataset):
             row_dict["extra_info"] = dict()
         index = row_dict.get("extra_info", {}).get("index", 0)
         tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
-        interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
         need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
-        row_dict["placeholder"]= torch.zeros(1)
+        row_dict["placeholder"] = torch.zeros(1)
         row_dict["messages"] = messages
-        row_dict['seq_len'] = seq_len
-
+        row_dict["seq_len"] = seq_len
 
         return row_dict
 

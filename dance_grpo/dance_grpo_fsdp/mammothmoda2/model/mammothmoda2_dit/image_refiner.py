@@ -177,7 +177,9 @@ class SimpleQFormerImageEmbedder(nn.Module):
 
             # Cross-attention: queries attend to inputs
             q_norm = layer["ln_q2"](q)
-            cross_out, _ = layer["cross_attn"](q_norm, kv, kv, need_weights=False, key_padding_mask=~attention_mask.bool())
+            cross_out, _ = layer["cross_attn"](
+                q_norm, kv, kv, need_weights=False, key_padding_mask=~attention_mask.bool()
+            )
             q = q + cross_out
 
             # Feed-forward

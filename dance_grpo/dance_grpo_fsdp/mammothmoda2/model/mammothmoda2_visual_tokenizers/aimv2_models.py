@@ -1,7 +1,7 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 import functools
-from typing import Any, Callable, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Literal, Optional
 
 from torch import nn
 
@@ -32,7 +32,7 @@ class AIMv2VisionMixin:
         input_pixels: ArrayLike,
         mask: Optional[ArrayLike] = None,
         output_features: bool = False,
-    ) -> Union[ArrayLike, Tuple[ArrayLike, Tuple[ArrayLike, ...]]]:
+    ) -> ArrayLike | tuple[ArrayLike, tuple[ArrayLike, ...]]:
         x = self.preprocessor(input_pixels)
         x, features = self.trunk(x, mask=mask)
         x = self.head(x)
@@ -42,8 +42,8 @@ class AIMv2VisionMixin:
 class AIMv2VisionEncoder(AIMv2VisionMixin, nn.Module):
     def __init__(
         self,
-        img_size: Union[int, Tuple[int, int]] = 224,
-        patch_size: Union[int, Tuple[int, int]] = 14,
+        img_size: int | tuple[int, int] = 224,
+        patch_size: int | tuple[int, int] = 14,
         embed_dim: int = 1024,
         mlp_hidden_dim: int = 2816,
         num_blocks: int = 24,

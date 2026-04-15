@@ -101,6 +101,7 @@ def create_image_prompt(image_tokens, tokenizer, mode="movqgan_2x8", imgstr_mode
             str: The formatted image prompt for the view.
         """
         if imgstr_mode == "naive":
+            h, w = view.shape[:2] if len(view.shape) >= 2 else (1, 1)
             imgstr = to_imgstr_flatten(view.reshape(-1))
 
             return (tokenizer.boi_token + tag + tokenizer.img_token + imgstr + tokenizer.eoi_token), (h, w)

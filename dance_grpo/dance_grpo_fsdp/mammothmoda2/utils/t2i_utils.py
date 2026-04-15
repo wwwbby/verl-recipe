@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
-
 from recipe.dance_grpo.mammothmoda2.model.mammothmoda2_dit import FlowMatchEulerDiscreteScheduler, RotaryPosEmbedReal
 
 from .misc import Singleton
@@ -29,10 +28,11 @@ if TYPE_CHECKING:
     import numpy as np
     from diffusers.image_processor import PipelineImageInput
     from PIL import Image
-
     from recipe.dance_grpo.mammothmoda2.model import Mammothmoda2Model, MammothUTokenizer
 
-__all__ = ["decode_diffusion_image", ]
+__all__ = [
+    "decode_diffusion_image",
+]
 
 
 class VAEProcessor(Singleton):
@@ -79,7 +79,8 @@ def extract_condition_tokens(
     if max_condition_len == 0:
         return hidden_states.new_zeros(B, 0, D), hidden_states.new_zeros(B, 0, dtype=torch.bool)
 
-    condition_tokens_compact = condition_tokens_sorted[:, :max_condition_len, :]  # (B, max_condition_len, D)
+    # (B, max_condition_len, D)
+    condition_tokens_compact = condition_tokens_sorted[:, :max_condition_len, :]
     condition_attention_mask = torch.arange(max_condition_len, device=hidden_states.device).expand(
         B, -1
     ) < condition_lengths.unsqueeze(1)
@@ -295,8 +296,8 @@ def decode_diffusion_image(
     width: int = 512,
     device: torch.device = None,
     index: int | None = 0,
-    init_same_noise = True,
-    return_img_only = False,
+    init_same_noise=True,
+    return_img_only=False,
     **kwargs,  # noqa: ARG001
 ) -> dict:
     # 1. Get the full condition_features, both positive and negative

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from loguru import logger
+from recipe.dance_grpo.mammothmoda2.utils import ClassifierFreeGuidanceLogitsProcessor, SampledScopeLogitsProcessor
 from torch import nn
 from transformers import GenerationConfig, PreTrainedModel
 from transformers.cache_utils import DynamicCache
@@ -28,8 +29,6 @@ from transformers.generation import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-
-from recipe.dance_grpo.mammothmoda2.utils import ClassifierFreeGuidanceLogitsProcessor, SampledScopeLogitsProcessor
 
 from .configuration_mammothmoda2 import Mammothmoda2Config
 from .mammothmoda2_dit import (
@@ -43,7 +42,7 @@ from .mammothmoda2_qwen3_vl.modeling_mammothmoda2_qwen3_vl import (
     Mammothmoda2Qwen3VLForConditionalGeneration,
     Qwen3VLTextRMSNorm,
 )
-from .mammothmoda2_visual_tokenizers import get_mammothmoda2_visual_tokenizer, create_image_prompt_batch
+from .mammothmoda2_visual_tokenizers import create_image_prompt_batch, get_mammothmoda2_visual_tokenizer
 
 if TYPE_CHECKING:
     from transformers.generation.utils import GenerateOutput
@@ -54,7 +53,8 @@ class Mammothmoda2PreTrainedModel(PreTrainedModel):
     """Mammothmoda VL Pretrained model inherit from Qwen2PreTrainedModel."""
 
     config_class = Mammothmoda2Config
-    base_model_prefix = "llm_model"  # Key to the llm base model for all HF style nested PreTrainedModel.
+    # Key to the llm base model for all HF style nested PreTrainedModel.
+    base_model_prefix = "llm_model"
     supports_gradient_checkpointing = True
     _skip_keys_device_placement: ClassVar = ["past_key_values"]
     _supports_flash_attn_2 = True
@@ -208,7 +208,7 @@ class Mammothmoda2Model(Mammothmoda2PreTrainedModel):
         # Initialize caption_embedder weights
         nn.init.trunc_normal_(self.gen_transformer.time_caption_embed.caption_embedder[1].weight, std=0.02)
         nn.init.zeros_(self.gen_transformer.time_caption_embed.caption_embedder[1].bias)
-    
+
     def reinit_image_embedder(self, config: dict) -> None:
         """Reinitialize image_embedder to adapt to Qwen2.5-VL."""
         logger.info("Reinitializing image_embedder")
@@ -219,7 +219,7 @@ class Mammothmoda2Model(Mammothmoda2PreTrainedModel):
             num_heads=max(1, self.gen_transformer.hidden_size // 128),
             **config,
         )
-    
+
     @torch.inference_mode()
     def image_generate_preprocess(
         self,
@@ -245,7 +245,8 @@ class Mammothmoda2Model(Mammothmoda2PreTrainedModel):
         n_gen_token_1 = (input_ids == tokenizer.gen_placeholder_id).sum()
         if n_gen_token_0 != n_gen_token_1:
             raise ValueError(
-                f"Gen token nums in tokenizer and input_ids do not match: tokenizer: {n_gen_token_0}, input_ids: {n_gen_token_1}"
+                f"Gen token nums in tokenizer and input_ids do not match: "
+                f"tokenizer: {n_gen_token_0}, input_ids: {n_gen_token_1}"
             )
         mask = input_ids == tokenizer.gen_placeholder_id
         input_ids = input_ids.masked_scatter(mask, gen_token_ids)
@@ -281,7 +282,7 @@ class Mammothmoda2Model(Mammothmoda2PreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         gen_pixel_values: torch.FloatTensor | None = None,
-        tokenizer = None,
+        tokenizer=None,
         generation_config: GenerationConfig | None = None,
         ar_height: int = 16,
         ar_width: int = 16,

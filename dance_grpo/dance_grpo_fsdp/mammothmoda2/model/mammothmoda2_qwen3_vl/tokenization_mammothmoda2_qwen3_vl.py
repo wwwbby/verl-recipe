@@ -44,7 +44,10 @@ VOCAB_FILES_NAMES = {
     "special_tokens_file": "mammothu_vision_tokens.txt",
 }
 
-PAT_STR = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+PAT_STR = (
+    r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| """
+    r"""?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+)
 ENDOFTEXT = "<|endoftext|>"
 IMSTART = "<|im_start|>"
 IMEND = "<|im_end|>"
@@ -78,7 +81,8 @@ QWEN_SPECIAL_TOKENS = (
 )
 
 # align to qwen2.5 tokenizer length (151846)
-EXTRAS = [f"<|extra_{i}|>" for i in range(181)]  # 205 - 19[len(QWEN_SPECIAL_TOKENS)] - 5
+# 205 - 19[len(QWEN_SPECIAL_TOKENS)] - 5
+EXTRAS = [f"<|extra_{i}|>" for i in range(181)]
 # align to qwen2.5 embedding size (152064)
 EXTRAS += [
     f"<|extra_margin_{i}|>" for i in range(152064 - 151846 - 4)

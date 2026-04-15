@@ -18,69 +18,38 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import json
 import logging
 import os
-import uuid
 from collections import defaultdict
-from copy import deepcopy
-from dataclasses import dataclass, field
-from itertools import chain
 from pprint import pprint
 from typing import Optional
 
-import numpy as np
-import ray
 import torch
 from omegaconf import OmegaConf, open_dict
-from tensordict import NonTensorData
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.ray import (RayClassWithInitArgs, RayResourcePool,
-                                        RayWorkerGroup)
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.metric_utils import (compute_data_metrics,
-                                           compute_throughout_metrics,
-                                           compute_timing_metrics,
-                                           process_validation_metrics)
-from verl.trainer.ppo.ray_trainer import (AdvantageEstimator, RayPPOTrainer,
-                                          ResourcePoolManager,
-                                          apply_kl_penalty, compute_advantage,
-                                          compute_response_mask)
-from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import (Role, WorkerType, need_critic,
-                                    need_reference_policy, need_reward_model)
-from verl.utils import tensordict_utils as tu
-from verl.utils.checkpoint.checkpoint_manager import (find_latest_ckpt_path,
-                                                      should_save_ckpt_esi)
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager
+from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.metric import reduce_metrics
-from verl.utils.py_functional import append_to_dict
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.seqlen_balancing import (calculate_workload,
-                                         get_seqlen_balanced_partitions,
-                                         log_seqlen_unbalance)
-from verl.utils.torch_functional import masked_mean
+from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.utils.padding import (left_right_2_no_padding,
-                                        no_padding_2_padding)
 
 _py_logger = logging.getLogger(__name__)
 _py_logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+
 def get_current_context():
     import inspect
     import os
-    import sys
+
     """获取当前执行的上下文信息"""
     frame = inspect.currentframe()
 
@@ -92,21 +61,17 @@ def get_current_context():
 
     # 尝试获取类名
     class_name = None
-    if 'self' in caller_frame.f_locals:
-        class_name = caller_frame.f_locals['self'].__class__.__name__
-    elif 'cls' in caller_frame.f_locals:
-        class_name = caller_frame.f_locals['cls'].__name__
+    if "self" in caller_frame.f_locals:
+        class_name = caller_frame.f_locals["self"].__class__.__name__
+    elif "cls" in caller_frame.f_locals:
+        class_name = caller_frame.f_locals["cls"].__name__
 
     # 获取文件名和行号
     filename = os.path.basename(caller_frame.f_code.co_filename)
     line_no = caller_frame.f_lineno
 
-    return {
-        'class': class_name,
-        'function': function_name,
-        'file': filename,
-        'line': line_no
-    }
+    return {"class": class_name, "function": function_name, "file": filename, "line": line_no}
+
 
 class RayDANCETrainer(RayPPOTrainer):
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
@@ -217,7 +182,7 @@ class RayDANCETrainer(RayPPOTrainer):
                 role=str(actor_role),
             )
             self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
-          
+
             # Create Mllm worker
             # mllm_role = Role.Mllm
             # mllm_resource_pool = self.resource_pool_manager.get_resource_pool(mllm_role)
@@ -268,8 +233,8 @@ class RayDANCETrainer(RayPPOTrainer):
             # Only require nsight worker options when tool is nsys
             if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
                 assert (
-                        OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                        is not None
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
                 ), "worker_nsight_options must be set when using nsys with profile_steps"
                 wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
@@ -308,7 +273,7 @@ class RayDANCETrainer(RayPPOTrainer):
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
         # self.actor_rollout_wg.init_model()
-      
+
         # Initialize Mllm worker group
         # self.mllm_wg = all_wg[str(Role.Mllm)]
         # self.mllm_wg.init_model()
@@ -332,10 +297,10 @@ class RayDANCETrainer(RayPPOTrainer):
                 worker_group=self.actor_rollout_wg,
                 rm_resource_pool=rm_resource_pool,
             )
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         seq_len_list = batch.non_tensor_batch["seq_len"]
-        batch_size = batch.batch.batch_size[0]
         world_size = self.actor_rollout_wg.world_size
         total_seq_list = []
         for i in range(len(batch)):
@@ -372,7 +337,6 @@ class RayDANCETrainer(RayPPOTrainer):
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
-
 
     def fit(self):
         """
@@ -412,16 +376,16 @@ class RayDANCETrainer(RayPPOTrainer):
             _fixed_samples = [self.train_dataset[i] for i in _fixed_indices]
             _fixed_eval_data = DataProto.from_single_dict(self.collate_fn(_fixed_samples))
             _fixed_eval_data.meta_info["global_step"] = 0
-            _fixed_eval_data.meta_info["experiment_name"] = self.config.trainer.get(
-                "experiment_name", "dance_grpo"
-            )
+            _fixed_eval_data.meta_info["experiment_name"] = self.config.trainer.get("experiment_name", "dance_grpo")
             self.actor_rollout_wg.init_fixed_eval(_fixed_eval_data)
             _py_logger.info(f"Fixed evaluation initialised with {n_eval} prompts.")
             # Run an initial eval at step 0 to record the model's pre-training baseline.
-            _init_eval_data = DataProto(meta_info={
-                "global_step": 0,
-                "experiment_name": self.config.trainer.get("experiment_name", "dance_grpo"),
-            })
+            _init_eval_data = DataProto(
+                meta_info={
+                    "global_step": 0,
+                    "experiment_name": self.config.trainer.get("experiment_name", "dance_grpo"),
+                }
+            )
             self.actor_rollout_wg.run_fixed_eval(_init_eval_data)
             _py_logger.info("Initial fixed eval (step 0) complete.")
 
@@ -445,7 +409,6 @@ class RayDANCETrainer(RayPPOTrainer):
         # we start from step 1
         self.global_steps += 1
         self.gen_steps += 1
-        last_val_metrics = None
 
         prev_step_profile = False
         curr_step_profile = (
@@ -453,14 +416,12 @@ class RayDANCETrainer(RayPPOTrainer):
             if self.config.global_profiler.steps is not None
             else False
         )
-        next_step_profile = False
 
         timing_raw = defaultdict(float)
         batch = None
-        num_prompt_in_batch = 0
         num_gen_batches = 0
         current_epoch = self.global_steps // len(self.train_dataloader)
-      
+
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
@@ -498,12 +459,12 @@ class RayDANCETrainer(RayPPOTrainer):
                     # inputs to track how generation quality improves across steps.
                     if self._fixed_eval_enabled:
                         with marked_timer("fixed_eval", timing_raw):
-                            _eval_data = DataProto(meta_info={
-                                "global_step": self.global_steps,
-                                "experiment_name": self.config.trainer.get(
-                                    "experiment_name", "dance_grpo"
-                                ),
-                            })
+                            _eval_data = DataProto(
+                                meta_info={
+                                    "global_step": self.global_steps,
+                                    "experiment_name": self.config.trainer.get("experiment_name", "dance_grpo"),
+                                }
+                            )
                             self.actor_rollout_wg.run_fixed_eval(_eval_data)
 
                 # Collect actor training metrics.
@@ -513,8 +474,7 @@ class RayDANCETrainer(RayPPOTrainer):
                     try:
                         actor_metrics_raw = actor_output.meta_info.get("metrics", {})
                         actor_metrics = {
-                            k: (v[0] if isinstance(v, (list, tuple)) else v)
-                            for k, v in actor_metrics_raw.items()
+                            k: (v[0] if isinstance(v, (list, tuple)) else v) for k, v in actor_metrics_raw.items()
                         }
                         metrics.update(actor_metrics)
                     except Exception:
@@ -523,7 +483,8 @@ class RayDANCETrainer(RayPPOTrainer):
                 # Compute reward and advantage metrics from the gathered batch DataProto
                 # so that mean/min/max reflect all samples across all workers.
                 if batch is not None and "rewards" in batch.batch.keys():
-                    rewards = batch.batch["rewards"].float().cpu()  # already scaled at reward model output
+                    # already scaled at reward model output
+                    rewards = batch.batch["rewards"].float().cpu()
                     grpo_size = self.config.actor_rollout_ref.rollout.n
                     _batch_size = rewards.shape[0]
                     advantages = torch.zeros_like(rewards)
@@ -531,16 +492,18 @@ class RayDANCETrainer(RayPPOTrainer):
                     for _g in group_indices:
                         group_r = rewards[_g]
                         advantages[_g] = (group_r - group_r.mean()) / group_r.std().clamp_min(1e-8)
-                    metrics.update({
-                        "train/reward_mean":    rewards.mean().item(),
-                        "train/reward_max":     rewards.max().item(),
-                        "train/reward_min":     rewards.min().item(),
-                        "train/reward_std":     rewards.std().item(),
-                        "train/advantage_mean": advantages.mean().item(),
-                        "train/advantage_max":  advantages.max().item(),
-                        "train/advantage_min":  advantages.min().item(),
-                        "train/advantage_std":  advantages.std().item(),
-                    })
+                    metrics.update(
+                        {
+                            "train/reward_mean": rewards.mean().item(),
+                            "train/reward_max": rewards.max().item(),
+                            "train/reward_min": rewards.min().item(),
+                            "train/reward_std": rewards.std().item(),
+                            "train/advantage_mean": advantages.mean().item(),
+                            "train/advantage_max": advantages.max().item(),
+                            "train/advantage_min": advantages.min().item(),
+                            "train/advantage_std": advantages.std().item(),
+                        }
+                    )
 
                 metrics.update(
                     {
@@ -551,7 +514,6 @@ class RayDANCETrainer(RayPPOTrainer):
 
                 _py_logger.info(f"Epoch {epoch} - Step {self.global_steps}: {metrics}")
 
-                n_gpus = self.resource_pool_manager.get_n_gpus()
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
                 self.global_steps += 1
@@ -560,10 +522,9 @@ class RayDANCETrainer(RayPPOTrainer):
                     progress_bar.close()
                     return
 
-
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({}) & batch.non_tensor_batch.keys()
-        batch_keys_to_pop = ['placeholder']
+        batch_keys_to_pop = ["placeholder"]
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -577,8 +538,7 @@ class RayDANCETrainer(RayPPOTrainer):
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
 
-        from recipe.dance_grpo.main_dance import (create_rl_dataset,
-                                                     create_rl_sampler)
+        from recipe.dance_grpo.main_dance import create_rl_dataset, create_rl_sampler
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(
@@ -601,8 +561,8 @@ class RayDANCETrainer(RayPPOTrainer):
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
-            from recipe.dance_grpo.utiles.rl_latent_dataset import \
-                collate_fn as default_collate_fn
+            from recipe.dance_grpo.utiles.rl_latent_dataset import collate_fn as default_collate_fn
+
             collate_fn = default_collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
@@ -654,4 +614,3 @@ class RayDANCETrainer(RayPPOTrainer):
                     self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
-

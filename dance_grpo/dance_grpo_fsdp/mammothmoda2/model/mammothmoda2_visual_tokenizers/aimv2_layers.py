@@ -2,7 +2,7 @@
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 
 import functools
-from typing import Any, Callable, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Literal, Optional, Sequence
 
 import torch
 from torch import nn
@@ -80,7 +80,7 @@ class TextPreprocessor(nn.Module):
         self.max_context_length = max_context_length
         self.eos_token_id = eos_token_id
 
-    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         _, N = input_ids.shape
         max_len = min(N, self.max_context_length)
         eos_token_mask = input_ids == self.eos_token_id
@@ -206,7 +206,7 @@ class Transformer(nn.Module):
         mask: Optional[torch.Tensor] = None,
         max_block_id: Optional[int] = -1,
         return_features: bool = False,
-    ) -> Union[Tuple[torch.Tensor, List[torch.Tensor]], List[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor]] | list[torch.Tensor]:
         # only evaluate up to the max block id
         if max_block_id is None:
             assert self.post_transformer_layer is not None, "Unable to determine the max block id."
@@ -278,8 +278,8 @@ class SinCosPosEmbed(nn.Module):
 class PatchEmbed(nn.Module):
     def __init__(
         self,
-        img_size: Union[int, Tuple[int, int]] = 224,
-        patch_size: Union[int, Tuple[int, int]] = 16,
+        img_size: int | tuple[int, int] = 224,
+        patch_size: int | tuple[int, int] = 16,
         in_chans: int = 3,
         embed_dim: int = 768,
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
@@ -436,7 +436,7 @@ class AverageLayers(nn.Module):
         self.layers = layers
         self.reduce = reduce
 
-    def forward(self, _: torch.Tensor, layer_features: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, _: torch.Tensor, layer_features: list[torch.Tensor]) -> torch.Tensor:
         layer_features = [layer_features[layer_id] for layer_id in self.layers]
         feats = torch.stack(layer_features, dim=-1).mean(dim=-1)
 

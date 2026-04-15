@@ -22,16 +22,12 @@ import hydra
 import ray
 import torch
 from omegaconf import OmegaConf
-
 from recipe.dance_grpo.dance_ray_trainer import RayDANCETrainer
-from verl.experimental.dataset.sampler import AbstractSampler
+
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
-from verl.utils.import_utils import load_extern_object
 
 
 @hydra.main(config_path="config", config_name="dance_ppo_trainer", version_base=None)
@@ -62,7 +58,8 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     if task_runner_class is None:
-        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+        # please make sure main_task is not scheduled on head
+        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
@@ -129,8 +126,8 @@ class TaskRunner:
             return actor_rollout_cls, ray_worker_group_cls
 
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            from recipe.dance_grpo.diffusion_workers import \
-                DiffusionActorRolloutWorker
+            from recipe.dance_grpo.diffusion_workers import DiffusionActorRolloutWorker
+
             actor_rollout_cls = DiffusionActorRolloutWorker
             ray_worker_group_cls = RayWorkerGroup
         else:
@@ -138,13 +135,11 @@ class TaskRunner:
 
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
         self.mapping[Role.ActorRollout] = "global_pool"
-      
+
         # Add MllmWorker for Qwen3-VL understanding
         from verl.trainer.ppo.ray_trainer import Role
-      
+
         return actor_rollout_cls, ray_worker_group_cls
-
-
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
@@ -225,7 +220,6 @@ class TaskRunner:
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
 
-
         # We should adopt a multi-source reward function here:
         # - for rule-based rm, we directly call a reward score
         # - for model-based rm, we call a model
@@ -246,17 +240,13 @@ class TaskRunner:
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
-        )
+        copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
 
         # Simplify by setting tokenizer and processor to None
         tokenizer = None
         processor = None
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
-
-        from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
         train_dataset, train_collate_fn = create_rl_dataset(
@@ -305,45 +295,45 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     class PickAPicDataset(Dataset):
         """Dataset for PickAPic that extracts only the prompt field."""
-      
+
         def __init__(self, data_files, max_samples=-1):
             self.data = []
-          
+
             # Handle case where data_files is a single string
             if isinstance(data_files, str):
                 data_files = [data_files]
-          
+
             # Load and parse JSON files
             for data_file in data_files:
                 if not os.path.exists(data_file):
                     continue
-              
-                with open(data_file, 'r', encoding='utf-8') as f:
+
+                with open(data_file, encoding="utf-8") as f:
                     entries = json.load(f)
-                  
+
                 # Extract only the prompt field
                 for entry in entries:
-                    if 'prompt' in entry:
-                        self.data.append({'prompt': entry['prompt']})
-                  
+                    if "prompt" in entry:
+                        self.data.append({"prompt": entry["prompt"]})
+
                     # Stop if max_samples is reached
                     if max_samples > 0 and len(self.data) >= max_samples:
                         break
-              
+
                 if max_samples > 0 and len(self.data) >= max_samples:
                     break
-      
+
         def __len__(self):
             return len(self.data)
-      
+
         def __getitem__(self, idx):
             return self.data[idx]
-  
+
     # Define collate function that returns numpy array
     def collate_fn(batch):
         """Collate function that returns a numpy array of prompts."""
         # Extract prompts from batch
-        prompts = [item['prompt'] for item in batch]
+        prompts = [item["prompt"] for item in batch]
         # Return as numpy array
         return {"prompts": np.array(prompts, dtype=object), "dummy": torch.ones(len(prompts))}
 
@@ -363,6 +353,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 def create_rl_sampler(data_config, dataset):
     import torch
     from torch.utils.data import SequentialSampler
+
     # torch.utils.data.RandomSampler could not recover properly
     from torchdata.stateful_dataloader.sampler import RandomSampler
 

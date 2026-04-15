@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from transformers import AutoProcessor, AutoConfig
+from transformers import AutoConfig, AutoProcessor
 
 from .configuration_mammothmoda2 import Mammothmoda2Config
 from .mammothmoda2_qwen3_vl import *  # noqa: F403
-from .modeling_mammothmoda2 import Mammothmoda2Model
-from .processing_mammothmoda2 import DEFAULT_NEGATIVE_PROMPT, Mammothmoda2Processor
+from .modeling_mammothmoda2 import Mammothmoda2Model  # noqa: F401
+from .processing_mammothmoda2 import DEFAULT_NEGATIVE_PROMPT, Mammothmoda2Processor  # noqa: F401
 
 AutoConfig.register(Mammothmoda2Config.model_type, Mammothmoda2Config)
 AutoProcessor.register(Mammothmoda2Config, Mammothmoda2Processor)

@@ -90,7 +90,10 @@ class Transport:
         """
         shape = th.tensor(z.size())
         N = th.prod(shape[1:])
-        _fn = lambda x: -N / 2.0 * np.log(2 * np.pi) - th.sum(x**2) / 2.0
+
+        def _fn(x):
+            return -N / 2.0 * np.log(2 * np.pi) - th.sum(x**2) / 2.0
+
         return th.vmap(_fn)(z)
 
     def check_interval(
@@ -154,7 +157,7 @@ class Transport:
                     t[_] = 0.0
             # print(t)
         else:
-            raise NotImplementedError("Not implemented snr_type %s" % self.snr_type)
+            raise NotImplementedError(f"Not implemented snr_type {self.snr_type}")
 
         if self.do_shift:
             if self.dynamic_time_shift:
@@ -239,7 +242,7 @@ class Transport:
 
         if "cond" in model_kwargs:
             conds = model_kwargs.pop("cond")
-            xt = [th.cat([x, cond], dim=0) if cond is not None else x for x, cond in zip(xt, conds)]
+            xt = [th.cat([x, cond], dim=0) if cond is not None else x for x, cond in zip(xt, conds, strict=True)]
         model_output = model(xt, t, **model_kwargs)
         B = len(x0)
 
@@ -259,7 +262,7 @@ class Transport:
                     dim=0,
                 )
             else:
-                terms["task_loss"] = mean_flat(((model_output - ut) ** 2))
+                terms["task_loss"] = mean_flat((model_output - ut) ** 2)
         else:
             raise NotImplementedError
 
