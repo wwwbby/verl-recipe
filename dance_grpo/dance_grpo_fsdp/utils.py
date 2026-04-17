@@ -148,10 +148,6 @@ def init_fsdp_module(module, strategy="fsdp2", process_group=None, only_forward=
     else:
         raise NotImplementedError(f"Unknown strategy {strategy}")
 
-    # if self.model_config.enable_activation_offload:
-    #     enable_gradient_checkpointing = self.model_config.enable_gradient_checkpointing
-    #     enable_activation_offloading(module, self.engine_config.strategy, enable_gradient_checkpointing)
-
     if torch.distributed.get_world_size() == 1 and fsdp_version(module) == 1:
         FSDP.set_state_dict_type(
             module,
@@ -165,5 +161,4 @@ def init_fsdp_module(module, strategy="fsdp2", process_group=None, only_forward=
             state_dict_config=ShardedStateDictConfig(),
         )
 
-    # module.enable_gradient_checkpointing()
     return module

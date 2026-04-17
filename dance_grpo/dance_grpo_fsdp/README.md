@@ -26,7 +26,7 @@ cd ..
 # Update the recipe directory.
 git clone https://github.com/verl-project/verl-recipe.git
 mkdir verl/recipe/dance_grpo
-cp -rf verl-recipe/dance_grpo/dance_grpo_mindspeed_mm verl/recipe/dance_grpo/
+cp -rf verl-recipe/dance_grpo/dance_grpo_ fsdp verl/recipe/dance_grpo/
 
 # Installing the HPSv3 Scoring Model
 git clone https://github.com/MizzenAI/HPSv3.git
@@ -73,17 +73,8 @@ Modify the HPSv3/hpsv3/config/HPSv3_7B.yaml file to configure the directory for 
 model_name_or_path: "/home/CKPT/Qwen2-VL-7B-Instruct"
 ```
 
-## 5. Parameters for configuring args ##
 
-Modify the following parameters and run the script to generate the args file for training preparation:
-
-| Configuration File                                                                      | Modifying a field | Modification Description                                                                                           |
-| --------------------------------------------------------------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------ |
-| verl/recipe/dance_grpo/dance_grpo_mindspeed_mm/examples/wan2.2/5B/t2v/model.json        | from_pretrained   | Set this parameter to the path corresponding to the downloaded weight (including tokenizer, ae, and text_encoder). |
-| verl/recipe/dance_grpo/dance_grpo_mindspeed_mm/examples/wan2.2/5B/t2v/get_train_args.sh | LOAD_PATH         | Pre-training weight path after DCP weight conversion in the WAN 2.2 model                                          |
-| verl/recipe/dance_grpo/dance_grpo_mindspeed_mm/examples/wan2.2/5B/fsdp2_config.yaml     | sharding_size     | Indicates the number of fragments with the weight in FSDP2 mode, which is usually the same as the number of cards. |
-
-## 6. Model RL training ##
+## 5. Model RL training ##
 
 Modifying Parameters in the verl/recipe/dance_grpo/dance_grpo_fsdp/run_verl_dance.sh RL Training Script
 

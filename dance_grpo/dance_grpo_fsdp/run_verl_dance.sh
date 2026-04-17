@@ -1,8 +1,6 @@
 # ray stop --force
 
 export CUSTOM_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-source /share/y00609984/cann/ascend-toolkit/set_env.sh
-source /share/y00609984/cann/nnal/atb/set_env.sh
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1
 export HCCL_HOST_SOCKET_PORT_RANGE="auto"
@@ -10,10 +8,10 @@ export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 mkdir -p logs
 export WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 
-TRAIN_DATA=${TRAIN_DATA:-"/home/w00836812/workspace/recipe/dance_grpo_mm/data/pickapic_single.json"}
+TRAIN_DATA=${TRAIN_DATA:-""}
 VAL_DATA=${VAL_DATA:-"$TRAIN_DATA"}
-MODEL_PATH=${MODEL_PATH:-"/home/work/MammothModa2-Dev"}
-REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-"/home/work/HPSv3/HPSv3.safetensors"}
+MODEL_PATH=${MODEL_PATH:-""}
+REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-""}
 
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
