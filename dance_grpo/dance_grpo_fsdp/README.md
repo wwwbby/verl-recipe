@@ -60,7 +60,8 @@ cd verl
 
 ## 2. Dataset preparation ##
 
-Reference ` verl/recipe/dance_grpo/dance_grpo_fsdp/data/prompt.json ` In the example provided in, you can replace the customized prompt text and run the following command to generate a parquet file:
+This repository include a demo dataset ` verl/recipe/dance_grpo/dance_grpo_fsdp/data/pickapic_single.json`. It is a subset of the 
+HPDv3 dataset, available at https://huggingface.co/datasets/MizzenAI/HPDv3/blob/main/pickapic.json
 
 ## 3. Training model preparation ##
 
@@ -229,7 +230,7 @@ bash recipe/dance_grpo/dance_grpo/run_verl_dance.sh
 
 ## Result
 
-![Alt text](https://private-user-images.githubusercontent.com/60009003/582408366-60037777-5644-49ac-a5de-fbdc5c9d7e17.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NzY5MTUyMzYsIm5iZiI6MTc3NjkxNDkzNiwicGF0aCI6Ii82MDAwOTAwMy81ODI0MDgzNjYtNjAwMzc3NzctNTY0NC00OWFjLWE1ZGUtZmJkYzVjOWQ3ZTE3LnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjA0MjMlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwNDIzVDAzMjg1NlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPWJmMzQ1Y2U4N2FjM2I0MDZkYmJlNzlkNzdjZTkzMjNlOGI4NWIyNjA3OTE1MTVhZjcyN2I1N2UzMDhiMWE0YjMmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnJlc3BvbnNlLWNvbnRlbnQtdHlwZT1pbWFnZSUyRnBuZyJ9.Z2ox4R8nA97YELYpkUjYfD7luiBq158jMBg8bTcKCm0)
+![Alt text](https://github.com/user-attachments/assets/60037777-5644-49ac-a5de-fbdc5c9d7e17)
 
 ## Design
 ### Module Reference
